@@ -96,8 +96,69 @@ fn build_tool_specs() -> Value {
                     "required": ["command"]
                 }
             }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_projects",
+                "description": "List all existing projects in the workspace root. Returns array of {name, summary, last_modified}. Summary is auto-extracted from each project's README.md / review.md / index.html title. Call this FIRST when the user references past work ('continue yesterday's game', 'change the hello world', 'add music to the spaceship'). Then read_file/write_file with paths like '<project_name>/index.html'.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                }
+            }
         }
     ])
+}
+
+/// v1.0.7 — list direct subdirectories of workspace cwd, with brief summary per project.
+/// Summary source priority: README.md (first 300 chars) → review.md → index.html <title>.
+fn list_projects_impl(cwd: &Path) -> String {
+    let rd = match std::fs::read_dir(cwd) {
+        Ok(r) => r,
+        Err(e) => return format!("err: read_dir {}: {e}", cwd.display()),
+    };
+    let mut projects: Vec<(std::time::SystemTime, String, String)> = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        // Pull a brief summary
+        let summary = ["README.md", "review.md", "index.html"]
+            .iter()
+            .find_map(|f| {
+                let fp = path.join(f);
+                std::fs::read_to_string(&fp).ok().map(|content| {
+                    if *f == "index.html" {
+                        if let Some(start) = content.to_lowercase().find("<title>") {
+                            if let Some(end_rel) = content[start + 7..].find("</title>") {
+                                return content[start + 7..start + 7 + end_rel]
+                                    .trim()
+                                    .to_string();
+                            }
+                        }
+                    }
+                    content.chars().take(300).collect::<String>().replace('\n', " ")
+                })
+            })
+            .unwrap_or_else(|| "(empty)".to_string());
+        projects.push((modified, name, summary));
+    }
+    projects.sort_by(|a, b| b.0.cmp(&a.0)); // newest first
+    if projects.is_empty() {
+        return "(no projects yet)".to_string();
+    }
+    let mut out = String::new();
+    for (_, name, summary) in projects.iter().take(20) {
+        out.push_str(&format!("- {name}: {}\n", truncate(summary, 200)));
+    }
+    out
 }
 
 /// Resolve a tool-supplied relative path inside cwd. Rejects absolute paths and .. traversal.
@@ -180,6 +241,7 @@ async fn exec_simple_tool(name: &str, args: &Value, cwd: &Path) -> String {
                 Err(e) => format!("err: {e}"),
             }
         }
+        "list_projects" => list_projects_impl(cwd),
         "run_shell" => {
             let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
             if command.is_empty() {
