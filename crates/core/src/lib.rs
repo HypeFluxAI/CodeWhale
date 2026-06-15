@@ -27,6 +27,15 @@ use codewhale_tools::{ToolCall, ToolRegistry};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+fn truncate(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        s.to_string()
+    } else {
+        let cut: String = s.chars().take(max).collect();
+        format!("{cut}…")
+    }
+}
+
 /// How a new thread's conversation history is initialized.
 #[derive(Debug, Clone)]
 pub enum InitialHistory {
@@ -1006,7 +1015,14 @@ impl Runtime {
         }
     }
 
-    /// Resolves the model for a prompt, records the message, and returns the response.
+    /// Sends a prompt to the model and returns the assistant's text response.
+    ///
+    /// Real LLM call (OpenAI-compatible chat/completions) to {base_url}/chat/completions
+    /// with thread history. Appends user + assistant messages to the thread.
+    ///
+    /// Tool calling not yet wired here — first cut returns plain text; the client
+    /// (ThinkAI Tauri / TUI) parses fenced ```language blocks and writes files
+    /// to the thread's cwd.
     pub async fn handle_prompt(
         &mut self,
         req: PromptRequest,
@@ -1025,10 +1041,105 @@ impl Runtime {
                 response_id: response_id.clone(),
             })
             .await;
+
+        // Build OpenAI-compatible messages from thread history + new user prompt.
+        let mut messages: Vec<serde_json::Value> = Vec::new();
+        if let Some(thread_id) = req.thread_id.as_ref() {
+            let history = self
+                .thread_manager
+                .store
+                .list_messages(thread_id, Some(50))
+                .unwrap_or_default();
+            for msg in history {
+                // Skip system-internal payload messages (ours from past stub) — heuristic: empty or JSON-ish role-less
+                let role = match msg.role.as_str() {
+                    "user" | "assistant" | "system" | "tool" => msg.role.clone(),
+                    _ => continue,
+                };
+                messages.push(json!({"role": role, "content": msg.content}));
+            }
+        }
+        messages.push(json!({"role": "user", "content": req.prompt.clone()}));
+
+        let api_key = resolved
+            .api_key
+            .clone()
+            .unwrap_or_default();
+        if api_key.trim().is_empty() {
+            return Err(anyhow::anyhow!(
+                "no API key configured for provider {} (set DEEPSEEK_API_KEY)",
+                resolved.provider.as_str()
+            ));
+        }
+
+        let base = if resolved.base_url.trim().is_empty() {
+            "https://api.deepseek.com/v1".to_string()
+        } else {
+            resolved.base_url.clone()
+        };
+        let url = if base.ends_with("/chat/completions") {
+            base.clone()
+        } else {
+            format!("{}/chat/completions", base.trim_end_matches('/'))
+        };
+
+        // Pick a concrete model id LLM will accept.
+        // resolved_model can be "auto" — fall back to a safe DeepSeek default in that case.
+        let api_model = if resolved_model == "auto" || resolved_model.is_empty() {
+            "deepseek-chat".to_string()
+        } else {
+            resolved_model.clone()
+        };
+
+        let body = json!({
+            "model": api_model,
+            "messages": messages,
+            "stream": false,
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(180))
+            .build()
+            .map_err(|e| anyhow::anyhow!("reqwest builder failed: {e}"))?;
+
+        let resp = client
+            .post(&url)
+            .header("Authorization", format!("Bearer {api_key}"))
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| anyhow::anyhow!("LLM call to {url} failed: {e}"))?;
+
+        let status = resp.status();
+        let raw_text = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "LLM HTTP {status} from {url}: {}",
+                truncate(&raw_text, 800)
+            ));
+        }
+
+        let parsed: serde_json::Value = serde_json::from_str(&raw_text)
+            .map_err(|e| anyhow::anyhow!("LLM response JSON parse failed: {e}; raw: {}", truncate(&raw_text, 400)))?;
+
+        let assistant_text = parsed
+            .pointer("/choices/0/message/content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        if assistant_text.is_empty() {
+            return Err(anyhow::anyhow!(
+                "LLM returned empty content. raw: {}",
+                truncate(&raw_text, 600)
+            ));
+        }
+
         self.hooks
             .emit(HookEvent::ResponseDelta {
                 response_id: response_id.clone(),
-                delta: "model-selected".to_string(),
+                delta: assistant_text.clone(),
             })
             .await;
         self.hooks
@@ -1037,23 +1148,17 @@ impl Runtime {
             })
             .await;
 
-        let payload = json!({
-            "provider": resolved.provider.as_str(),
-            "model": resolved_model.clone(),
-            "prompt": req.prompt,
-            "telemetry": resolved.telemetry,
-            "base_url": resolved.base_url,
-            "has_api_key": resolved.api_key.as_ref().is_some_and(|k| !k.trim().is_empty()),
-            "approval_policy": resolved.approval_policy,
-            "sandbox_mode": resolved.sandbox_mode
-        });
         if let Some(thread_id) = req.thread_id.as_ref() {
-            self.thread_manager.touch_message(thread_id, &req.prompt)?;
+            // Append user + assistant
+            let _ = self
+                .thread_manager
+                .store
+                .append_message(thread_id, "user", &req.prompt, None);
             let assistant_message_id = self.thread_manager.store.append_message(
                 thread_id,
                 "assistant",
-                &payload.to_string(),
-                Some(payload.clone()),
+                &assistant_text,
+                None,
             )?;
             self.persist_latest_checkpoint(
                 thread_id,
@@ -1068,16 +1173,11 @@ impl Runtime {
         }
 
         Ok(PromptResponse {
-            output: payload.to_string(),
+            output: assistant_text,
             model: resolved_model,
             events: vec![
                 EventFrame::ResponseStart {
                     response_id: response_id.clone(),
-                },
-                EventFrame::ResponseDelta {
-                    response_id: response_id.clone(),
-                    delta: "model-selected".to_string(),
-                    channel: ResponseChannel::Text,
                 },
                 EventFrame::ResponseEnd { response_id },
             ],

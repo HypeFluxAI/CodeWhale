@@ -18,5 +18,8 @@ codewhale-protocol = { path = "../protocol", version = "0.8.58" }
 codewhale-state = { path = "../state", version = "0.8.58" }
 codewhale-tools = { path = "../tools", version = "0.8.58" }
 serde_json.workspace = true
+serde = { workspace = true }
+reqwest = { workspace = true }
+tokio = { workspace = true }
 tracing.workspace = true
 uuid.workspace = true
