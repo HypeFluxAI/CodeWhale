@@ -36,6 +36,190 @@ fn truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// v1.0.5 — OpenAI function-calling tool specs (write_file/read_file/run_shell/list_dir).
+/// LLM uses these to build multi-file projects. Paths are relative to thread cwd.
+fn build_tool_specs() -> Value {
+    json!([
+        {
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "description": "Write text content to a file at the given relative path inside the project workspace. Creates parent directories as needed. Overwrites if file exists. Use this for every file you want to deliver — index.html, style.css, app.js, README.md, Python/Node sources, etc.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path from project root (e.g. 'index.html', 'src/app.js', 'README.md')"},
+                        "content": {"type": "string", "description": "File content (utf-8 text)"}
+                    },
+                    "required": ["path", "content"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_file",
+                "description": "Read text content of a file at the given relative path inside the project workspace. Use this to inspect your own previously-written files when revising or to read user-provided data.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path from project root"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_dir",
+                "description": "List entries in a directory relative to the project workspace. Returns names + types (file/dir).",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "path": {"type": "string", "description": "Relative path from project root. '.' or '' for project root"}
+                    },
+                    "required": ["path"]
+                }
+            }
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_shell",
+                "description": "Run a shell command inside the project workspace. Returns stdout/stderr/exit code. Use for npm install / pip install / build / test / git commands. Has 60s timeout per command.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "command": {"type": "string", "description": "Shell command (executed via cmd /C on Windows, sh -c on unix)"}
+                    },
+                    "required": ["command"]
+                }
+            }
+        }
+    ])
+}
+
+/// Resolve a tool-supplied relative path inside cwd. Rejects absolute paths and .. traversal.
+fn safe_resolve(cwd: &Path, rel: &str) -> Result<PathBuf, String> {
+    let rel = rel.trim();
+    if rel.is_empty() || rel == "." {
+        return Ok(cwd.to_path_buf());
+    }
+    let p = Path::new(rel);
+    if p.is_absolute() {
+        return Err(format!("path must be relative, got {rel}"));
+    }
+    let mut full = cwd.to_path_buf();
+    for comp in p.components() {
+        match comp {
+            std::path::Component::Normal(s) => full.push(s),
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => return Err(format!("'..' not allowed in {rel}")),
+            _ => return Err(format!("invalid path component in {rel}")),
+        }
+    }
+    Ok(full)
+}
+
+/// Execute one tool call. Returns a string the LLM will read as the tool result.
+async fn exec_simple_tool(name: &str, args: &Value, cwd: &Path) -> String {
+    match name {
+        "write_file" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            let content = args.get("content").and_then(|v| v.as_str()).unwrap_or("");
+            match safe_resolve(cwd, path) {
+                Ok(full) => {
+                    if let Some(parent) = full.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    match std::fs::write(&full, content) {
+                        Ok(_) => format!("ok: wrote {} bytes to {}", content.len(), path),
+                        Err(e) => format!("err: write {path}: {e}"),
+                    }
+                }
+                Err(e) => format!("err: {e}"),
+            }
+        }
+        "read_file" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            match safe_resolve(cwd, path) {
+                Ok(full) => match std::fs::read_to_string(&full) {
+                    Ok(s) => {
+                        if s.chars().count() > 8000 {
+                            let head: String = s.chars().take(8000).collect();
+                            format!("{head}\n…(truncated, file was {} chars)", s.chars().count())
+                        } else {
+                            s
+                        }
+                    }
+                    Err(e) => format!("err: read {path}: {e}"),
+                },
+                Err(e) => format!("err: {e}"),
+            }
+        }
+        "list_dir" => {
+            let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+            match safe_resolve(cwd, path) {
+                Ok(full) => match std::fs::read_dir(&full) {
+                    Ok(rd) => {
+                        let mut out = Vec::new();
+                        for entry in rd.flatten() {
+                            let name = entry.file_name().to_string_lossy().to_string();
+                            let kind = if entry.path().is_dir() { "dir" } else { "file" };
+                            out.push(format!("{kind} {name}"));
+                        }
+                        if out.is_empty() {
+                            "(empty)".to_string()
+                        } else {
+                            out.join("\n")
+                        }
+                    }
+                    Err(e) => format!("err: list_dir {path}: {e}"),
+                },
+                Err(e) => format!("err: {e}"),
+            }
+        }
+        "run_shell" => {
+            let command = args.get("command").and_then(|v| v.as_str()).unwrap_or("");
+            if command.is_empty() {
+                return "err: empty command".to_string();
+            }
+            #[cfg(target_os = "windows")]
+            let (program, shell_arg) = ("cmd", "/C");
+            #[cfg(not(target_os = "windows"))]
+            let (program, shell_arg) = ("sh", "-c");
+            let timeout = std::time::Duration::from_secs(60);
+            let exec = tokio::process::Command::new(program)
+                .arg(shell_arg)
+                .arg(command)
+                .current_dir(cwd)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn();
+            let mut child = match exec {
+                Ok(c) => c,
+                Err(e) => return format!("err: spawn {command}: {e}"),
+            };
+            match tokio::time::timeout(timeout, child.wait_with_output()).await {
+                Ok(Ok(output)) => {
+                    let stdout = String::from_utf8_lossy(&output.stdout);
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    let exit_code = output.status.code().unwrap_or(-1);
+                    format!(
+                        "exit_code: {exit_code}\nstdout:\n{}\nstderr:\n{}",
+                        truncate(&stdout, 4000),
+                        truncate(&stderr, 2000)
+                    )
+                }
+                Ok(Err(e)) => format!("err: wait {command}: {e}"),
+                Err(_) => "err: timeout after 60s".to_string(),
+            }
+        }
+        _ => format!("err: unknown tool '{name}'"),
+    }
+}
+
 /// How a new thread's conversation history is initialized.
 #[derive(Debug, Clone)]
 pub enum InitialHistory {
@@ -822,8 +1006,16 @@ impl Runtime {
     /// Dispatches a thread request (create, start, resume, fork, list, read, etc.).
     pub async fn handle_thread(&mut self, req: ThreadRequest) -> Result<ThreadResponse> {
         match req {
-            ThreadRequest::Create { .. } => {
-                let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+            ThreadRequest::Create { metadata } => {
+                // v1.0.5 — honor metadata.cwd (was being silently dropped, leaked server cwd)
+                let cwd = metadata
+                    .get("cwd")
+                    .and_then(|v| v.as_str())
+                    .map(PathBuf::from)
+                    .filter(|p| p.exists())
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+                    });
                 let new = self.thread_manager.spawn_thread_with_history(
                     "deepseek".to_string(),
                     cwd,
@@ -1015,14 +1207,15 @@ impl Runtime {
         }
     }
 
-    /// Sends a prompt to the model and returns the assistant's text response.
+    /// Real LLM call with OpenAI-compatible function calling (tools).
     ///
-    /// Real LLM call (OpenAI-compatible chat/completions) to {base_url}/chat/completions
-    /// with thread history. Appends user + assistant messages to the thread.
+    /// Loop: send chat/completions with `tools` array → if response has tool_calls,
+    /// execute each (write_file/read_file/run_shell/list_dir against thread cwd),
+    /// append tool result messages, re-send. Repeat until LLM returns no tool_calls
+    /// (final text answer). Max 30 iterations to avoid runaway loops.
     ///
-    /// Tool calling not yet wired here — first cut returns plain text; the client
-    /// (ThinkAI Tauri / TUI) parses fenced ```language blocks and writes files
-    /// to the thread's cwd.
+    /// This is the v1.0.5 path for ThinkAI Kids — lets LLM build multi-file projects
+    /// in any language by directly invoking tools, not by parsing fenced code blocks.
     pub async fn handle_prompt(
         &mut self,
         req: PromptRequest,
@@ -1042,6 +1235,14 @@ impl Runtime {
             })
             .await;
 
+        // Resolve thread cwd — tools execute inside this dir.
+        let cwd: PathBuf = req
+            .thread_id
+            .as_ref()
+            .and_then(|tid| self.thread_manager.store.get_thread(tid).ok().flatten())
+            .map(|t| t.cwd)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+
         // Build OpenAI-compatible messages from thread history + new user prompt.
         let mut messages: Vec<serde_json::Value> = Vec::new();
         if let Some(thread_id) = req.thread_id.as_ref() {
@@ -1051,7 +1252,6 @@ impl Runtime {
                 .list_messages(thread_id, Some(50))
                 .unwrap_or_default();
             for msg in history {
-                // Skip system-internal payload messages (ours from past stub) — heuristic: empty or JSON-ish role-less
                 let role = match msg.role.as_str() {
                     "user" | "assistant" | "system" | "tool" => msg.role.clone(),
                     _ => continue,
@@ -1061,10 +1261,7 @@ impl Runtime {
         }
         messages.push(json!({"role": "user", "content": req.prompt.clone()}));
 
-        let api_key = resolved
-            .api_key
-            .clone()
-            .unwrap_or_default();
+        let api_key = resolved.api_key.clone().unwrap_or_default();
         if api_key.trim().is_empty() {
             return Err(anyhow::anyhow!(
                 "no API key configured for provider {} (set DEEPSEEK_API_KEY)",
@@ -1083,63 +1280,138 @@ impl Runtime {
             format!("{}/chat/completions", base.trim_end_matches('/'))
         };
 
-        // Pick a concrete model id LLM will accept.
-        // resolved_model can be "auto" — fall back to a safe DeepSeek default in that case.
         let api_model = if resolved_model == "auto" || resolved_model.is_empty() {
             "deepseek-chat".to_string()
         } else {
             resolved_model.clone()
         };
 
-        let body = json!({
-            "model": api_model,
-            "messages": messages,
-            "stream": false,
-        });
-
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(180))
+            .timeout(std::time::Duration::from_secs(300))
             .build()
             .map_err(|e| anyhow::anyhow!("reqwest builder failed: {e}"))?;
 
-        let resp = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow::anyhow!("LLM call to {url} failed: {e}"))?;
+        let tools = build_tool_specs();
 
-        let status = resp.status();
-        let raw_text = resp.text().await.unwrap_or_default();
-        if !status.is_success() {
-            return Err(anyhow::anyhow!(
-                "LLM HTTP {status} from {url}: {}",
-                truncate(&raw_text, 800)
-            ));
+        // Tool-calling loop
+        let mut final_text = String::new();
+        let mut tool_call_total = 0;
+        let max_iter = 30;
+        for iter in 0..max_iter {
+            let body = json!({
+                "model": api_model,
+                "messages": messages,
+                "tools": tools,
+                "tool_choice": "auto",
+                "stream": false,
+            });
+
+            let resp = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .header("Content-Type", "application/json")
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| anyhow::anyhow!("LLM call to {url} failed (iter {iter}): {e}"))?;
+
+            let status = resp.status();
+            let raw_text = resp.text().await.unwrap_or_default();
+            if !status.is_success() {
+                return Err(anyhow::anyhow!(
+                    "LLM HTTP {status} from {url} (iter {iter}): {}",
+                    truncate(&raw_text, 800)
+                ));
+            }
+
+            let parsed: serde_json::Value = serde_json::from_str(&raw_text).map_err(|e| {
+                anyhow::anyhow!(
+                    "LLM JSON parse failed (iter {iter}): {e}; raw: {}",
+                    truncate(&raw_text, 400)
+                )
+            })?;
+
+            let msg = parsed
+                .pointer("/choices/0/message")
+                .cloned()
+                .unwrap_or(Value::Null);
+
+            let tool_calls = msg
+                .get("tool_calls")
+                .and_then(|v| v.as_array())
+                .cloned();
+
+            if let Some(calls) = tool_calls.filter(|c| !c.is_empty()) {
+                // Append the assistant message verbatim so we can pair tool_call_ids.
+                messages.push(msg.clone());
+
+                for call in &calls {
+                    tool_call_total += 1;
+                    let call_id = call
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let fn_name = call
+                        .pointer("/function/name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let fn_args_raw = call
+                        .pointer("/function/arguments")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("{}")
+                        .to_string();
+                    let fn_args: Value = serde_json::from_str(&fn_args_raw).unwrap_or(json!({}));
+
+                    self.hooks
+                        .emit(HookEvent::ToolLifecycle {
+                            response_id: response_id.clone(),
+                            tool_name: fn_name.clone(),
+                            phase: "invoke".to_string(),
+                            payload: fn_args.clone(),
+                        })
+                        .await;
+
+                    let result_text = exec_simple_tool(&fn_name, &fn_args, &cwd).await;
+
+                    self.hooks
+                        .emit(HookEvent::ToolLifecycle {
+                            response_id: response_id.clone(),
+                            tool_name: fn_name.clone(),
+                            phase: "result".to_string(),
+                            payload: json!({"result": truncate(&result_text, 400)}),
+                        })
+                        .await;
+
+                    messages.push(json!({
+                        "role": "tool",
+                        "tool_call_id": call_id,
+                        "content": result_text,
+                    }));
+                }
+                continue; // next iteration: LLM sees tool results
+            }
+
+            // No more tool calls → final answer
+            final_text = msg
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            break;
         }
 
-        let parsed: serde_json::Value = serde_json::from_str(&raw_text)
-            .map_err(|e| anyhow::anyhow!("LLM response JSON parse failed: {e}; raw: {}", truncate(&raw_text, 400)))?;
-
-        let assistant_text = parsed
-            .pointer("/choices/0/message/content")
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string();
-
-        if assistant_text.is_empty() {
-            return Err(anyhow::anyhow!(
-                "LLM returned empty content. raw: {}",
-                truncate(&raw_text, 600)
-            ));
+        if final_text.is_empty() {
+            final_text = format!(
+                "(没拿到最终文字, 但跑了 {tool_call_total} 次工具调用 — 检查 cwd 里的文件)"
+            );
         }
 
         self.hooks
             .emit(HookEvent::ResponseDelta {
                 response_id: response_id.clone(),
-                delta: assistant_text.clone(),
+                delta: final_text.clone(),
             })
             .await;
         self.hooks
@@ -1149,7 +1421,6 @@ impl Runtime {
             .await;
 
         if let Some(thread_id) = req.thread_id.as_ref() {
-            // Append user + assistant
             let _ = self
                 .thread_manager
                 .store
@@ -1157,7 +1428,7 @@ impl Runtime {
             let assistant_message_id = self.thread_manager.store.append_message(
                 thread_id,
                 "assistant",
-                &assistant_text,
+                &final_text,
                 None,
             )?;
             self.persist_latest_checkpoint(
@@ -1167,13 +1438,14 @@ impl Runtime {
                     "response_id": response_id.clone(),
                     "model": resolved_model.clone(),
                     "provider": resolved.provider.as_str(),
-                    "assistant_message_id": assistant_message_id
+                    "assistant_message_id": assistant_message_id,
+                    "tool_calls": tool_call_total,
                 }),
             )?;
         }
 
         Ok(PromptResponse {
-            output: assistant_text,
+            output: final_text,
             model: resolved_model,
             events: vec![
                 EventFrame::ResponseStart {
