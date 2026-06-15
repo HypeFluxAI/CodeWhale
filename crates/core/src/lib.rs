@@ -1357,8 +1357,12 @@ impl Runtime {
 
         // Tool-calling loop
         let mut final_text = String::new();
+        // 1.0.8: track last assistant content seen across iters, used if we hit max_iter
+        // before the LLM emits a tool-call-free final message.
+        let mut last_assistant_with_content = String::new();
         let mut tool_call_total = 0;
-        let max_iter = 30;
+        // v1.0.8: 30→80. Complex agentic editing (50KB+ files, helper scripts) needs more headroom.
+        let max_iter = 80;
         for iter in 0..max_iter {
             let body = json!({
                 "model": api_model,
@@ -1402,6 +1406,14 @@ impl Runtime {
                 .get("tool_calls")
                 .and_then(|v| v.as_array())
                 .cloned();
+
+            // 1.0.8: capture content from this turn even if it's accompanied by tool_calls
+            // (some models narrate alongside calls). Last one wins → best fallback.
+            if let Some(c) = msg.get("content").and_then(|v| v.as_str()) {
+                if !c.trim().is_empty() {
+                    last_assistant_with_content = c.to_string();
+                }
+            }
 
             if let Some(calls) = tool_calls.filter(|c| !c.is_empty()) {
                 // Append the assistant message verbatim so we can pair tool_call_ids.
@@ -1464,10 +1476,19 @@ impl Runtime {
             break;
         }
 
+        // 1.0.8: if loop broke without a tool_call-free final answer, fall back to the
+        // last content the assistant produced mid-loop (often "I'm still working on X").
+        // Only use the synthetic "you hit limit" string if we never saw ANY assistant content.
         if final_text.is_empty() {
-            final_text = format!(
-                "(没拿到最终文字, 但跑了 {tool_call_total} 次工具调用 — 检查 cwd 里的文件)"
-            );
+            if !last_assistant_with_content.is_empty() {
+                final_text = format!(
+                    "{last_assistant_with_content}\n\n_(跑了 {tool_call_total} 次工具调用, 文件应已写好)_"
+                );
+            } else {
+                final_text = format!(
+                    "(LLM 跑满 {max_iter} 轮工具循环未收尾, 总 {tool_call_total} 次调用 — 检查 cwd 里的文件)"
+                );
+            }
         }
 
         self.hooks
