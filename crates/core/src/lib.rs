@@ -252,13 +252,20 @@ async fn exec_simple_tool(name: &str, args: &Value, cwd: &Path) -> String {
             #[cfg(not(target_os = "windows"))]
             let (program, shell_arg) = ("sh", "-c");
             let timeout = std::time::Duration::from_secs(60);
-            let exec = tokio::process::Command::new(program)
-                .arg(shell_arg)
+            let mut cmd = tokio::process::Command::new(program);
+            cmd.arg(shell_arg)
                 .arg(command)
                 .current_dir(cwd)
                 .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
+                .stderr(std::process::Stdio::piped());
+            // v1.0.9: Windows 上加 CREATE_NO_WINDOW (0x08000000), 不让 cmd 子进程弹黑色 console 窗口.
+            // Tauri 主进程是 GUI app, spawn cmd 默认会附带可见窗口闪一下 — 孩子被吓到.
+            #[cfg(target_os = "windows")]
+            {
+                use std::os::windows::process::CommandExt;
+                cmd.creation_flags(0x08000000);
+            }
+            let exec = cmd.spawn();
             let mut child = match exec {
                 Ok(c) => c,
                 Err(e) => return format!("err: spawn {command}: {e}"),
