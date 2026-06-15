@@ -1356,7 +1356,9 @@ impl Runtime {
         };
 
         let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(300))
+            // 1.0.28: 每次 LLM round-trip 上限 (不是总时长 — 总时长由调用方 reqwest client 控).
+            // 大 prompt + V4 Pro reasoning + tools 单次 round-trip 可超 5 分钟, 抬到 10 分钟.
+            .timeout(std::time::Duration::from_secs(600))
             .build()
             .map_err(|e| anyhow::anyhow!("reqwest builder failed: {e}"))?;
 
