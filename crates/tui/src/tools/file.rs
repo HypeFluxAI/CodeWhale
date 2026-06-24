@@ -760,7 +760,13 @@ fn leading_whitespace_fuzzy_matches(contents: &str, search: &str) -> Vec<(usize,
             };
         let original_end = byte_map.get(norm_end).copied().unwrap_or(contents.len());
         matches.push((original_start, original_end));
-        cursor = norm_start.saturating_add(1);
+        // cursor advance MUST respect UTF-8 char boundary in `normalized_contents`,
+        // else next-iter `normalized_contents[cursor..]` panics on multi-byte CJK / emoji.
+        // Repro: agent-edited HTML with '开'(3-byte) / '🪨'/'👑'(4-byte) at byte 5K-11K.
+        let next = norm_start.saturating_add(1);
+        cursor = (next..=normalized_contents.len())
+            .find(|&i| normalized_contents.is_char_boundary(i))
+            .unwrap_or(normalized_contents.len());
     }
     matches
 }
@@ -822,7 +828,12 @@ fn punctuation_normalized_matches(contents: &str, search: &str) -> Vec<(usize, u
         };
         let original_end = byte_map.get(norm_end).copied().unwrap_or(contents.len());
         matches.push((original_start, original_end));
-        cursor = norm_start.saturating_add(1);
+        // cursor advance MUST respect UTF-8 char boundary in `norm_contents`,
+        // else next-iter `norm_contents[cursor..]` panics on multi-byte CJK / emoji.
+        let next = norm_start.saturating_add(1);
+        cursor = (next..=norm_contents.len())
+            .find(|&i| norm_contents.is_char_boundary(i))
+            .unwrap_or(norm_contents.len());
     }
     matches
 }
