@@ -3044,11 +3044,35 @@ pub const CODEWHALE_APP_DIR: &str = ".codewhale";
 /// Legacy DeepSeek-branded app directory name (compatibility fallback).
 pub const LEGACY_APP_DIR: &str = ".deepseek";
 
+/// Process-wide in-memory override for [`codewhale_home`].
+///
+/// Embedders (e.g. the ThinkAI Kids iPad app driving the agent in-process)
+/// must be able to redirect CodeWhale state into an app sandbox directory
+/// without mutating environment variables, which would pollute the host
+/// process. When set, this takes precedence over `$CODEWHALE_HOME`.
+static CODEWHALE_HOME_OVERRIDE: std::sync::RwLock<Option<PathBuf>> =
+    std::sync::RwLock::new(None);
+
+/// Set (or clear, with `None`) the process-wide CodeWhale home override.
+/// Takes precedence over `$CODEWHALE_HOME` in [`codewhale_home`] and thus
+/// in [`resolve_state_dir`] / [`ensure_state_dir`].
+pub fn set_codewhale_home_override(path: Option<PathBuf>) {
+    if let Ok(mut guard) = CODEWHALE_HOME_OVERRIDE.write() {
+        *guard = path;
+    }
+}
+
 /// Resolve the primary CodeWhale home directory.
 ///
-/// `$CODEWHALE_HOME` takes precedence when set. Otherwise defaults to
+/// The in-memory override from [`set_codewhale_home_override`] wins first,
+/// then `$CODEWHALE_HOME` when set. Otherwise defaults to
 /// `$HOME/.codewhale`. This is the write target for new product state.
 pub fn codewhale_home() -> Result<PathBuf> {
+    if let Ok(guard) = CODEWHALE_HOME_OVERRIDE.read()
+        && let Some(path) = guard.as_ref()
+    {
+        return Ok(path.clone());
+    }
     if let Ok(val) = std::env::var("CODEWHALE_HOME") {
         let trimmed = val.trim();
         if !trimmed.is_empty() {
