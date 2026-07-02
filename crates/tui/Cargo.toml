@@ -14,6 +14,10 @@ web = ["dep:schemaui", "schemaui/web", "json", "toml"]
 json = ["schemaui/json"]
 toml = ["schemaui/toml"]
 
+[lib]
+name = "codewhale_tui"
+path = "src/lib.rs"
+
 [[bin]]
 name = "codewhale-tui"
 path = "src/main.rs"
