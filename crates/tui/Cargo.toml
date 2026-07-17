@@ -8,7 +8,10 @@ description = "Terminal UI for open-source and open-weight coding models"
 default-run = "codewhale-tui"
 
 [features]
-default = ["tui", "json", "toml"]
+default = ["tui", "json", "toml", "execpolicy"]
+# execpolicy = Starlark 命令策略解析. 桌面/iPad 内嵌 (default-features=false) 时不带,
+# 绕开 starlark→starlark_map→allocative 在宿主依赖图的 hashbrown 冲突. exec 路径不用它.
+execpolicy = ["dep:starlark"]
 tui = ["dep:schemaui", "schemaui/tui", "json", "toml"]
 web = ["dep:schemaui", "schemaui/web", "json", "toml"]
 json = ["schemaui/json"]
@@ -91,7 +94,7 @@ arboard = "3.4"
 
 [target.'cfg(not(target_env = "ohos"))'.dependencies]
 portable-pty = "0.9"
-starlark = "0.13.0"
+starlark = { version = "0.13.0", optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6.3"

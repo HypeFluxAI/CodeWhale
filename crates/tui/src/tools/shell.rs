@@ -1769,6 +1769,7 @@ pub fn new_shared_shell_manager(workspace: PathBuf) -> SharedShellManager {
 // === ToolSpec Implementations ===
 
 use crate::command_safety::{SafetyLevel, analyze_command, extract_primary_command};
+#[cfg(feature = "execpolicy")]
 use crate::execpolicy::{ExecPolicyDecision, load_default_policy};
 use crate::features::Feature;
 use crate::tools::cargo_failure_summary::summarize_cargo_failure;
@@ -2097,7 +2098,11 @@ impl ToolSpec for ExecShellTool {
 
         let background = background || tty;
 
+        // execpolicy (Starlark 命令策略) 编译期可选. 桌面/iPad 内嵌构建 (default-features=false)
+        // 不带此 feature → 整块编译移除, 依赖 trust/auto 模式 + analyze_command 安全分析。
+        #[cfg(feature = "execpolicy")]
         let mut execpolicy_decision: Option<ExecPolicyDecision> = None;
+        #[cfg(feature = "execpolicy")]
         if context.features.enabled(Feature::ExecPolicy)
             && let Some(policy) = load_default_policy()
                 .map_err(|e| ToolError::execution_failed(format!("execpolicy load failed: {e}")))?
@@ -2388,6 +2393,20 @@ impl ToolSpec for ExecShellTool {
                     output = format!("{hint}\n\n{output}");
                 }
 
+                #[cfg(feature = "execpolicy")]
+                let execpolicy_meta: Option<serde_json::Value> =
+                    execpolicy_decision.as_ref().map(|decision| match decision {
+                        ExecPolicyDecision::Allow => json!({ "decision": "allow" }),
+                        ExecPolicyDecision::Deny(reason) => {
+                            json!({ "decision": "deny", "reason": reason })
+                        }
+                        ExecPolicyDecision::AskUser(reason) => {
+                            json!({ "decision": "ask_user", "reason": reason })
+                        }
+                    });
+                #[cfg(not(feature = "execpolicy"))]
+                let execpolicy_meta: Option<serde_json::Value> = None;
+
                 let mut metadata = json!({
                     "exit_code": result.exit_code,
                     "status": format!("{:?}", result.status),
@@ -2409,19 +2428,7 @@ impl ToolSpec for ExecShellTool {
                     "interactive": interactive,
                     "combined_output": combined_output,
                     "canceled": was_cancelled,
-                    "execpolicy": execpolicy_decision.as_ref().map(|decision| match decision {
-                        ExecPolicyDecision::Allow => json!({
-                            "decision": "allow",
-                        }),
-                        ExecPolicyDecision::Deny(reason) => json!({
-                            "decision": "deny",
-                            "reason": reason,
-                        }),
-                        ExecPolicyDecision::AskUser(reason) => json!({
-                            "decision": "ask_user",
-                            "reason": reason,
-                        }),
-                    }),
+                    "execpolicy": execpolicy_meta,
                 });
                 metadata["backgrounded"] = json!(background || backgrounded_foreground);
                 if result.status == ShellStatus::TimedOut && !background && !interactive {

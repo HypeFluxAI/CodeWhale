@@ -41,6 +41,7 @@ mod dependencies;
 mod error_taxonomy;
 mod eval;
 pub mod exec;
+#[cfg(feature = "execpolicy")]
 mod execpolicy;
 mod features;
 mod handoff;
@@ -281,6 +282,7 @@ enum Commands {
         command: McpCommand,
     },
     /// Execpolicy tooling
+    #[cfg(feature = "execpolicy")]
     Execpolicy(ExecpolicyCommand),
     /// Inspect feature flags
     Features(FeaturesCli),
@@ -792,12 +794,14 @@ enum McpCommand {
     },
 }
 
+#[cfg(feature = "execpolicy")]
 #[derive(Args, Debug, Clone)]
 struct ExecpolicyCommand {
     #[command(subcommand)]
     command: ExecpolicySubcommand,
 }
 
+#[cfg(feature = "execpolicy")]
 #[derive(Subcommand, Debug, Clone)]
 enum ExecpolicySubcommand {
     /// Check execpolicy files against a command
@@ -1055,6 +1059,7 @@ pub async fn cli_main() -> Result<()> {
                 let workspace = resolve_workspace(&cli);
                 run_mcp_command(&config, &workspace, command).await
             }
+            #[cfg(feature = "execpolicy")]
             Commands::Execpolicy(command) => {
                 let config = load_config_from_cli(&cli)?;
                 if !config.features().enabled(Feature::ExecPolicy) {
@@ -3647,6 +3652,7 @@ fn doctor_timeout_recovery_lines(config: &Config) -> Vec<String> {
     lines
 }
 
+#[cfg(feature = "execpolicy")]
 fn run_execpolicy_command(command: ExecpolicyCommand) -> Result<()> {
     match command.command {
         ExecpolicySubcommand::Check(cmd) => cmd.run(),
