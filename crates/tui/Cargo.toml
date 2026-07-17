@@ -49,6 +49,8 @@ ratatui = "0.30"
 regex = "1.11"
 reqwest = { version = "0.13.1", default-features = false, features = ["blocking", "json", "stream", "multipart", "form", "rustls-no-provider", "http2", "gzip", "brotli"] }
 rustls.workspace = true
+# iPad/Android #275: 内置 Mozilla 根证书, 替代 rustls-platform-verifier (Android 上需 JNI 初始化, Tauri 拿不到)
+webpki-roots = "0.26"
 qrcode = { version = "0.14", default-features = false }
 similar = "2"
 serde = { version = "1.0.228", features = ["derive"] }
