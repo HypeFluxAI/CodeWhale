@@ -1233,7 +1233,11 @@ pub(super) fn apply_reasoning_effort(
     };
     let normalized = effort.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "off" | "disabled" | "none" | "false" => match provider {
+        // ThinkAI item 4 decouple: "off_keep_history" disables thinking for THIS request
+        // (same wire as "off") BUT is deliberately NOT recognized by should_replay_reasoning_content,
+        // so historical reasoning_content is still replayed → the DeepSeek KV prefix cache stays warm
+        // across a thinking→off→thinking sequence (flipping replay would rewrite history & bust cache).
+        "off" | "disabled" | "none" | "false" | "off_keep_history" => match provider {
             ApiProvider::Deepseek
             | ApiProvider::DeepseekCN
             | ApiProvider::Openrouter

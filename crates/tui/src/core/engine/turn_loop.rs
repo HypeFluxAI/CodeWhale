@@ -263,6 +263,21 @@ impl Engine {
                 &self.session.messages,
             );
 
+            // ThinkAI item 4: fast mechanical turns. On a turn that merely feeds a prior
+            // *successful* tool_use result back to the model, drop reasoning to "off" so the
+            // SAME model runs non-thinking — the KV prefix cache stays warm (model unchanged),
+            // we just skip the think step to cut ~seconds/turn on long tool loops. First turn,
+            // fresh user input, and errored tools keep thinking. Opt-in (default off).
+            let reasoning_effort_for_turn = if self.config.fast_mechanical_turns
+                && is_mechanical_turn(&self.session.messages, self.turn_counter)
+            {
+                // "off_keep_history" (not plain "off"): disables thinking for THIS turn but keeps
+                // historical reasoning_content replay stable → prefix cache stays warm (decouple fix).
+                Some("off_keep_history".to_string())
+            } else {
+                effective_reasoning_effort
+            };
+
             // Check prefix-cache stability before building the request.
             // This detects system-prompt or tool-set drift that would
             // invalidate DeepSeek's KV prefix cache for this turn.
@@ -378,7 +393,7 @@ impl Engine {
                 },
                 metadata: None,
                 thinking: None,
-                reasoning_effort: effective_reasoning_effort,
+                reasoning_effort: reasoning_effort_for_turn,
                 stream: Some(true),
                 temperature: None,
                 top_p: None,
@@ -2369,6 +2384,39 @@ impl Engine {
         messages.push(self.runtime_prompt_message());
         messages
     }
+}
+
+/// ThinkAI item 4: is this a "mechanical" turn? True when the turn merely feeds a
+/// prior *successful* tool_use result back to the model — session.messages ends with a
+/// tool_result block, no fresh user text, no tool error. First turn (turn_counter <= 1)
+/// and turns right after fresh user input keep thinking. Used to drop reasoning_effort to
+/// "off" so the same model runs non-thinking (cache-safe latency cut on long tool loops).
+fn is_mechanical_turn(messages: &[Message], turn_counter: u64) -> bool {
+    if turn_counter <= 1 {
+        return false;
+    }
+    let Some(last) = messages.last() else {
+        return false;
+    };
+    if last.role != "user" {
+        return false; // only a tool_result feed-back turn is mechanical
+    }
+    let mut saw_tool_result = false;
+    for block in &last.content {
+        match block {
+            crate::models::ContentBlock::ToolResult { is_error, .. } => {
+                if *is_error == Some(true) {
+                    return false; // errored tool → keep thinking to recover
+                }
+                saw_tool_result = true;
+            }
+            crate::models::ContentBlock::Text { .. } => {
+                return false; // fresh user text mixed in → user just spoke, think
+            }
+            _ => {}
+        }
+    }
+    saw_tool_result
 }
 
 fn subagent_completion_runtime_message(payload: &str) -> Message {

@@ -340,6 +340,12 @@ pub struct EngineConfig {
     /// When true, force `tool_choice: "required"` and opt compatible function
     /// schemas into DeepSeek beta strict mode.
     pub strict_tool_mode: bool,
+    /// When true, drop `reasoning_effort` to `"off"` on *mechanical* turns
+    /// (turns that only process a prior successful tool_use, not the first
+    /// turn / a fresh user message / an error). Keeps the SAME model so the
+    /// KV prefix cache stays warm; just skips the thinking step to cut latency
+    /// on long tool loops. Off by default — opt-in via `--fast-mechanical-turns`.
+    pub fast_mechanical_turns: bool,
     /// Workshop / large-tool-output routing (#548). `None` disables routing.
     pub workshop: Option<crate::tools::large_output_router::WorkshopConfig>,
     /// Which search backend `web_search` should use. Default: DuckDuckGo.
@@ -411,6 +417,7 @@ impl Default for EngineConfig {
             speech_output_dir: None,
             vision_config: None,
             strict_tool_mode: false,
+            fast_mechanical_turns: false,
             goal_objective: None,
             allowed_tools: None,
             disallowed_tools: None,

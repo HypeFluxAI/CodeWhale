@@ -2020,6 +2020,9 @@ impl RuntimeThreadManager {
             .map(crate::config::LspConfigToml::into_runtime);
         let engine_cfg = EngineConfig {
             model: thread.model.clone(),
+            // ThinkAI item 4: opt-in via env (default off).
+            fast_mechanical_turns: std::env::var("CODEWHALE_FAST_MECHANICAL_TURNS").ok().as_deref()
+                == Some("1"),
             workspace: thread.workspace.clone(),
             allow_shell: thread.allow_shell,
             trust_mode: thread.trust_mode,

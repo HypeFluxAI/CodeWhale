@@ -859,6 +859,9 @@ fn handle_memory_quick_add(app: &mut App, input: &str, config: &Config) {
 fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
     EngineConfig {
         model: app.model.clone(),
+        // ThinkAI item 4: opt-in via env (default off).
+        fast_mechanical_turns: std::env::var("CODEWHALE_FAST_MECHANICAL_TURNS").ok().as_deref()
+            == Some("1"),
         workspace: app.workspace.clone(),
         allow_shell: app.allow_shell,
         trust_mode: app.trust_mode,

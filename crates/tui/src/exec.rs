@@ -475,6 +475,10 @@ async fn run_exec_agent_core(
         .map(crate::config::LspConfigToml::into_runtime);
     let engine_config = EngineConfig {
         model: effective_model.clone(),
+        // ThinkAI item 4: opt-in fast mechanical turns via env (default off). ThinkAI's
+        // subprocess sets CODEWHALE_FAST_MECHANICAL_TURNS=1 once verified on real games.
+        fast_mechanical_turns: std::env::var("CODEWHALE_FAST_MECHANICAL_TURNS").ok().as_deref()
+            == Some("1"),
         workspace: workspace.clone(),
         allow_shell: auto_approve || config.allow_shell(),
         trust_mode,

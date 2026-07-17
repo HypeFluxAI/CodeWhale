@@ -110,7 +110,7 @@ impl DeepSeekClient {
             .as_deref()
             .map(|raw| raw.trim().to_ascii_lowercase());
         match effort.as_deref() {
-            Some("off" | "disabled" | "none" | "false") => {}
+            Some("off" | "disabled" | "none" | "false" | "off_keep_history") => {}
             Some(level) if thinking_capable => {
                 body["thinking"] = json!({ "type": "adaptive" });
                 let mapped = match level {

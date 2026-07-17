@@ -614,7 +614,7 @@ fn tool_to_responses_function(tool: &Tool) -> Value {
 
 fn codex_responses_reasoning_effort(raw: &str) -> Option<&'static str> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "off" | "disabled" | "none" | "false" => None,
+        "off" | "disabled" | "none" | "false" | "off_keep_history" => None,
         "minimal" => Some("minimal"),
         "low" => Some("low"),
         "high" => Some("high"),
