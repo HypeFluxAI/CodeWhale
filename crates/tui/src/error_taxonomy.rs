@@ -378,6 +378,191 @@ pub fn classify_error_message(message: &str) -> ErrorCategory {
     ErrorCategory::Internal
 }
 
+/// GEN_RELIABILITY_FIX A3: stable structured error-code token for the client.
+///
+/// The client (ThinkAI Kids desktop/mobile) parses the leading `[CODE]` token
+/// off `run_exec`'s failure message to route the user-facing copy precisely —
+/// e.g. `[HTTP_402]` becomes a quota/subscription prompt, not a generic
+/// "network is slow". This is a low-coupling string contract; the original
+/// English detail is preserved after the token.
+///
+/// Codes (see spec):
+///   `[NET_STALL]`    idle / socket read timeout — connection alive-but-mute
+///   `[NET_RESET]`    connection reset / dropped mid-stream
+///   `[NET_CONNECT]`  could not connect / DNS resolution failed
+///   `[TLS]`          TLS handshake failure
+///   `[HTTP_401]`     unauthenticated (re-auth)
+///   `[HTTP_402]`     payment required (quota / subscription)
+///   `[HTTP_429]`     rate limited
+///   `[HTTP_5xx]`     upstream server error
+///   `[UPSTREAM_EMPTY]` upstream produced no content
+///   `[PARSE]`        malformed / unparseable response
+///   `[CANCELLED]`    user / caller cancelled
+///
+/// The message strings we classify here originate in `chat.rs`
+/// (`"Stream read error: {reqwest_err}"`, `"SSE stream idle timeout ..."`,
+/// `"SSE stream request failed: HTTP {status}: ..."`) and in `turn_loop.rs`
+/// (`StreamError::Stall` / transparent-retry failures). reqwest's
+/// `is_timeout()`/`is_connect()`/`status()` info is embedded in these strings
+/// by the time it reaches the boundary, so we match on the message — the same
+/// approach `classify_error_message` already uses. Because HTTP-status and
+/// reset phrasings are checked before the generic timeout/connect keywords,
+/// the more specific code always wins.
+#[must_use]
+pub fn run_exec_error_code(message: &str) -> &'static str {
+    let lower = message.to_lowercase();
+
+    // Cancellation first — never a network failure, must not be retried or
+    // mis-surfaced as an error to the child.
+    if lower.contains("cancel") || lower.contains("interrupted") || lower.contains("aborted") {
+        return "[CANCELLED]";
+    }
+
+    // Explicit HTTP status codes (from `SSE stream request failed: HTTP NNN`
+    // and provider error bodies). Check the exact billing/auth codes before
+    // the broad 5xx bucket and before the generic keyword scans, because a
+    // 402 must never be swallowed as "network slow".
+    if http_status_present(&lower, 401) || lower.contains("unauthorized") {
+        return "[HTTP_401]";
+    }
+    if http_status_present(&lower, 402)
+        || lower.contains("payment required")
+        || lower.contains("insufficient")
+        || lower.contains("quota")
+    {
+        return "[HTTP_402]";
+    }
+    if http_status_present(&lower, 429)
+        || lower.contains("rate limit")
+        || lower.contains("too many requests")
+    {
+        return "[HTTP_429]";
+    }
+    if http_status_present(&lower, 500)
+        || http_status_present(&lower, 502)
+        || http_status_present(&lower, 503)
+        || http_status_present(&lower, 504)
+        || lower.contains("bad gateway")
+        || lower.contains("service unavailable")
+        || lower.contains("gateway timeout")
+        || lower.contains("internal server error")
+    {
+        return "[HTTP_5xx]";
+    }
+
+    // TLS handshake failures — distinct from a plain connect failure so the
+    // client can tell "clock/cert problem" from "no route".
+    if lower.contains("tls")
+        || lower.contains("handshake")
+        || lower.contains("certificate")
+        || lower.contains("ssl")
+    {
+        return "[TLS]";
+    }
+
+    // Connection reset / dropped mid-stream (the mobile root cause). Reqwest
+    // surfaces these as "connection reset", "broken pipe", "stream read
+    // error", or a body-decode failure after bytes were flowing.
+    if lower.contains("reset")
+        || lower.contains("broken pipe")
+        || lower.contains("connection closed")
+        || lower.contains("connection aborted")
+        || lower.contains("stream read error")
+        || lower.contains("error decoding response body")
+        || lower.contains("chunk decode error")
+        || lower.contains("body decode")
+        || lower.contains("incomplete message")
+        || lower.contains("unexpected eof")
+    {
+        return "[NET_RESET]";
+    }
+
+    // Idle / read stall — connection is nominally alive but no data arrives.
+    if lower.contains("idle timeout")
+        || lower.contains("stream stalled")
+        || lower.contains("no data received")
+        || lower.contains("read timed out")
+        || lower.contains("timed out")
+        || lower.contains("timeout")
+    {
+        return "[NET_STALL]";
+    }
+
+    // Could not establish the connection at all (DNS / route / refused).
+    if lower.contains("dns")
+        || lower.contains("failed to lookup")
+        || lower.contains("name resolution")
+        || lower.contains("connection refused")
+        || lower.contains("could not connect")
+        || lower.contains("connect error")
+        || lower.contains("network is unreachable")
+        || lower.contains("no route to host")
+        || lower.contains("unreachable")
+    {
+        return "[NET_CONNECT]";
+    }
+
+    if lower.contains("parse") || lower.contains("malformed") || lower.contains("syntax") {
+        return "[PARSE]";
+    }
+
+    // Empty upstream: stream ended without producing any content.
+    if lower.contains("empty") || lower.contains("no content") || lower.contains("no output") {
+        return "[UPSTREAM_EMPTY]";
+    }
+
+    // Fall back on the broad category classifier so at least a network-shaped
+    // failure gets a network code rather than nothing.
+    match classify_error_message(message) {
+        ErrorCategory::Network => "[NET_RESET]",
+        ErrorCategory::Timeout => "[NET_STALL]",
+        ErrorCategory::RateLimit => "[HTTP_429]",
+        ErrorCategory::Authentication => "[HTTP_401]",
+        ErrorCategory::Parse => "[PARSE]",
+        _ => "",
+    }
+}
+
+/// Prefix `message` with its A3 error-code token when one applies and the
+/// message isn't already tagged. Returns the message unchanged when no code
+/// maps (so unclassified internal errors keep their original text) or when a
+/// `[CODE]` prefix is already present (idempotent — safe to call at multiple
+/// boundaries).
+#[must_use]
+pub fn with_error_code(message: impl Into<String>) -> String {
+    let message = message.into();
+    if message.starts_with('[') {
+        // Already tagged (e.g. re-tagged at an inner boundary) — don't
+        // double-prefix.
+        return message;
+    }
+    let code = run_exec_error_code(&message);
+    if code.is_empty() {
+        message
+    } else {
+        format!("{code} {message}")
+    }
+}
+
+/// True when `lower` contains `status` as a standalone HTTP status number
+/// (bounded by non-digits) so "402" matches but "14025" does not.
+fn http_status_present(lower: &str, status: u16) -> bool {
+    let needle = status.to_string();
+    let bytes = lower.as_bytes();
+    let mut start = 0;
+    while let Some(rel) = lower[start..].find(&needle) {
+        let idx = start + rel;
+        let before_ok = idx == 0 || !bytes[idx - 1].is_ascii_digit();
+        let after = idx + needle.len();
+        let after_ok = after >= bytes.len() || !bytes[after].is_ascii_digit();
+        if before_ok && after_ok {
+            return true;
+        }
+        start = idx + needle.len();
+    }
+    false
+}
+
 impl From<ToolError> for ErrorEnvelope {
     fn from(value: ToolError) -> Self {
         match value {
@@ -788,6 +973,100 @@ mod tests {
             format!("{env}"),
             "[warning] net_transient: DNS resolution failed"
         );
+    }
+
+    // === GEN_RELIABILITY_FIX A3: structured error-code token tests ===
+
+    #[test]
+    fn a3_maps_transport_failures_to_net_codes() {
+        // These are the exact phrasings chat.rs / turn_loop.rs produce.
+        assert_eq!(
+            run_exec_error_code("SSE stream idle timeout after 120s — no data received"),
+            "[NET_STALL]"
+        );
+        assert_eq!(
+            run_exec_error_code("Stream stalled: no data received for 120s, closing stream"),
+            "[NET_STALL]"
+        );
+        assert_eq!(
+            run_exec_error_code("Stream read error: connection reset by peer"),
+            "[NET_RESET]"
+        );
+        assert_eq!(
+            run_exec_error_code("Stream read error: error decoding response body"),
+            "[NET_RESET]"
+        );
+        assert_eq!(
+            run_exec_error_code("error sending request: connection refused"),
+            "[NET_CONNECT]"
+        );
+        assert_eq!(
+            run_exec_error_code("dns error: failed to lookup address information"),
+            "[NET_CONNECT]"
+        );
+    }
+
+    #[test]
+    fn a3_http_status_codes_beat_generic_network() {
+        // A 402 must NEVER be swallowed as a network error — the client
+        // shows a quota/subscription prompt, not "network is slow".
+        assert_eq!(
+            run_exec_error_code("SSE stream request failed: HTTP 402: insufficient quota"),
+            "[HTTP_402]"
+        );
+        assert_eq!(
+            run_exec_error_code("SSE stream request failed: HTTP 401: invalid token"),
+            "[HTTP_401]"
+        );
+        assert_eq!(
+            run_exec_error_code("SSE stream request failed: HTTP 429: rate limit reached"),
+            "[HTTP_429]"
+        );
+        assert_eq!(
+            run_exec_error_code("SSE stream request failed: HTTP 503: service unavailable"),
+            "[HTTP_5xx]"
+        );
+        assert_eq!(
+            run_exec_error_code("SSE stream request failed: HTTP 500: internal server error"),
+            "[HTTP_5xx]"
+        );
+    }
+
+    #[test]
+    fn a3_http_status_matcher_is_digit_bounded() {
+        // "14025" must not be read as a 402 or 429.
+        assert_eq!(run_exec_error_code("processed 14025 tokens then died"), "");
+        // But a bare "402" bounded by non-digits does match.
+        assert!(http_status_present("http 402 payment", 402));
+        assert!(!http_status_present("token 4025 used", 402));
+    }
+
+    #[test]
+    fn a3_tls_and_cancel_and_parse() {
+        assert_eq!(
+            run_exec_error_code("tls handshake failed: certificate expired"),
+            "[TLS]"
+        );
+        assert_eq!(run_exec_error_code("Request cancelled by user"), "[CANCELLED]");
+        assert_eq!(run_exec_error_code("turn interrupted"), "[CANCELLED]");
+        assert_eq!(
+            run_exec_error_code("failed to parse SSE data frame: malformed json"),
+            "[PARSE]"
+        );
+    }
+
+    #[test]
+    fn a3_with_error_code_is_idempotent_and_preserves_detail() {
+        let coded = with_error_code("Stream read error: connection reset by peer");
+        assert_eq!(coded, "[NET_RESET] Stream read error: connection reset by peer");
+        // Calling again must not double-prefix.
+        assert_eq!(with_error_code(coded.clone()), coded);
+    }
+
+    #[test]
+    fn a3_unclassified_internal_error_keeps_original_text() {
+        // No code maps → message returned unchanged (don't mislabel).
+        assert_eq!(with_error_code("something weird happened"), "something weird happened");
     }
 
     #[test]

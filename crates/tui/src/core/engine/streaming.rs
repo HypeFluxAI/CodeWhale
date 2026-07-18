@@ -72,6 +72,44 @@ pub(super) fn should_transparently_retry_stream(
 /// (#2990).
 pub(super) const MAX_STREAM_RETRIES: u32 = 3;
 
+/// GEN_RELIABILITY_FIX A1: budget for mid-stream reconnects *after* content
+/// was already received.
+///
+/// Root cause on mobile: a long generation (100–260s) rides one long-lived SSE
+/// connection. Cellular networks reliably drop it mid-flight (NAT rebind, cell
+/// handover, tower switch). The existing transparent retry (#103) only fires
+/// when *no* content had streamed yet — once the first delta landed, a network
+/// death killed the whole turn ("network is slow"). This budget lets the turn
+/// loop discard the partial assistant output and re-open the stream from the
+/// top on a *network-class* error even after content arrived. Two attempts
+/// rides out a couple of drops in a 4-minute generation without amplifying a
+/// real outage. Billing is fair: relay bills post-flight per actually-delivered
+/// bytes, so re-running only pays for the completed generation the user wanted.
+pub(super) const MAX_MIDSTREAM_RECONNECTS: u32 = 2;
+
+/// Decide whether a mid-stream error (after content was received) is a
+/// network-class failure eligible for an A1 reconnect.
+///
+/// We classify on the error *message* string: by the time the error reaches
+/// the turn loop it is an `anyhow::Error` whose original `reqwest::Error`
+/// (`is_timeout()`/`is_connect()`/`is_request()`/decode/reset) has been
+/// stringified in `chat.rs` (`"Stream read error: {e}"`, `"SSE stream idle
+/// timeout ..."`). String classification is the same approach
+/// `classify_error_message` already uses across the codebase.
+///
+/// Returns `true` ONLY for transport failures (timeout / connection reset /
+/// dropped / DNS / body-decode). Returns `false` for auth (401), payment
+/// (402), rate-limit (429), other 4xx, and any explicitly non-network error —
+/// re-opening the stream can't fix those and would just burn the budget. The
+/// caller additionally gates on cancellation.
+pub(super) fn is_reconnectable_stream_error(message: &str) -> bool {
+    use crate::error_taxonomy::run_exec_error_code;
+    matches!(
+        run_exec_error_code(message),
+        "[NET_STALL]" | "[NET_RESET]" | "[NET_CONNECT]" | "[HTTP_5xx]"
+    )
+}
+
 /// Wall-clock vs monotonic divergence above which we conclude the host slept
 /// mid-stream (#2990). `Instant` pauses during system sleep (CLOCK_UPTIME_RAW
 /// on macOS, CLOCK_MONOTONIC on Linux) while `SystemTime` keeps advancing, so
@@ -166,4 +204,56 @@ pub(crate) fn filter_tool_call_delta(delta: &str, in_tool_call: &mut bool) -> St
     }
 
     output
+}
+
+#[cfg(test)]
+mod reconnect_gate_tests {
+    use super::*;
+
+    #[test]
+    fn a1_reconnects_on_transport_failures() {
+        // The exact strings turn_loop.rs / chat.rs feed the gate.
+        assert!(is_reconnectable_stream_error(
+            "SSE stream idle timeout after 120s — no data received"
+        ));
+        assert!(is_reconnectable_stream_error(
+            "Stream stalled: no data received for 120s, closing stream"
+        ));
+        assert!(is_reconnectable_stream_error(
+            "Stream read error: connection reset by peer"
+        ));
+        assert!(is_reconnectable_stream_error(
+            "Stream read error: error decoding response body"
+        ));
+        assert!(is_reconnectable_stream_error(
+            "error sending request: connection refused"
+        ));
+        assert!(is_reconnectable_stream_error(
+            "SSE stream request failed: HTTP 503: service unavailable"
+        ));
+    }
+
+    #[test]
+    fn a1_does_not_reconnect_on_auth_payment_ratelimit() {
+        // Re-opening the stream cannot fix these — must NOT burn budget.
+        assert!(!is_reconnectable_stream_error(
+            "SSE stream request failed: HTTP 401: invalid token"
+        ));
+        assert!(!is_reconnectable_stream_error(
+            "SSE stream request failed: HTTP 402: insufficient quota"
+        ));
+        assert!(!is_reconnectable_stream_error(
+            "SSE stream request failed: HTTP 429: rate limit reached"
+        ));
+        assert!(!is_reconnectable_stream_error("Request cancelled by user"));
+        assert!(!is_reconnectable_stream_error(
+            "failed to parse SSE data frame: malformed json"
+        ));
+        assert!(!is_reconnectable_stream_error("some unrelated internal error"));
+    }
+
+    #[test]
+    fn a1_budget_is_two() {
+        assert_eq!(MAX_MIDSTREAM_RECONNECTS, 2);
+    }
 }

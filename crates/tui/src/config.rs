@@ -40,6 +40,17 @@ pub const MIN_SUBAGENT_HEARTBEAT_TIMEOUT_SECS: u64 = 30;
 /// Maximum accepted `[subagents] heartbeat_timeout_secs` (1 hour).
 pub const MAX_SUBAGENT_HEARTBEAT_TIMEOUT_SECS: u64 = 3600;
 /// Default per-SSE-chunk idle timeout, in seconds.
+///
+/// GEN_RELIABILITY_FIX A2: mobile (Android/iOS) defaults to a shorter 120s
+/// idle so a "name only" dead connection is detected sooner and handed to
+/// A1's mid-stream reconnect instead of hanging for the full 300s. Desktop
+/// keeps 300s (long V4 thinking turns legitimately pause between chunks and
+/// desktop networks don't silently drop the way cellular does). Explicit
+/// `[tui].stream_chunk_timeout_secs` config still overrides on both.
+#[cfg(any(target_os = "android", target_os = "ios"))]
+pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 120;
+/// Default per-SSE-chunk idle timeout, in seconds (desktop).
+#[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 300;
 /// Minimum accepted stream chunk timeout.
 pub const MIN_STREAM_CHUNK_TIMEOUT_SECS: u64 = 1;

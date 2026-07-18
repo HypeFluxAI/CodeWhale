@@ -490,6 +490,12 @@ impl Engine {
             let mut last_progress_mono = Instant::now();
             let mut last_progress_wall = std::time::SystemTime::now();
             let mut sleep_resume_pending = false;
+            // GEN_RELIABILITY_FIX A1: mid-stream reconnect budget. Counts
+            // reconnects taken *after* content was already received (the case
+            // the #103 transparent retry deliberately skips). Reset alongside
+            // `stream_start` is NOT done — the budget spans the whole turn so a
+            // pathological flapping connection can't loop forever.
+            let mut midstream_reconnects = 0u32;
             let mut stream_content_bytes: usize = 0;
             let (chunk_timeout_secs, chunk_timeout) = stream_chunk_timeout_budget(&self.config);
             let max_duration = Duration::from_secs(STREAM_MAX_DURATION_SECS);
@@ -504,13 +510,28 @@ impl Engine {
                             Ok(Some(event_result)) => Some(event_result),
                             Ok(None) => None, // stream ended normally
                             Err(_) => {
-                                let envelope = StreamError::Stall {
+                                // GEN_RELIABILITY_FIX A1: a chunk-idle stall is
+                                // now routed through the unified `Err(e)`
+                                // branch below (as a synthetic stall error)
+                                // instead of breaking the loop immediately.
+                                // That lets the transparent retry (no content
+                                // yet) OR the mid-stream reconnect (content
+                                // already received) recover it — a stalled
+                                // connection is exactly the mobile drop we want
+                                // to reconnect, not fail. The branch emits its
+                                // own error envelope only if it actually gives
+                                // up, so we don't double-report here. Reuse the
+                                // canonical Stall wording via the envelope (the
+                                // message contains "stalled"/"idle" so
+                                // `is_reconnectable_stream_error` classifies it
+                                // as NET_STALL).
+                                let stall_message = StreamError::Stall {
                                     timeout_secs: chunk_timeout_secs,
                                 }
-                                .into_envelope();
-                                crate::logging::warn(&envelope.message);
-                                let _ = self.tx_event.send(Event::error(envelope)).await;
-                                None
+                                .into_envelope()
+                                .message;
+                                crate::logging::warn(&stall_message);
+                                Some(Err(anyhow::anyhow!(stall_message)))
                             }
                         }
                     }
@@ -645,6 +666,110 @@ impl Engine {
                                 }
                             }
                         }
+                        // GEN_RELIABILITY_FIX A1: mid-stream reconnect AFTER
+                        // content was already received. The transparent retry
+                        // above only fires when nothing had streamed; on mobile
+                        // the killer case is a network drop *mid-generation*
+                        // (content already flowing), where the old code just
+                        // recorded the error and `continue`d onto a dead stream
+                        // → `.next()` returns `None` → whole turn fails. Here we
+                        // discard the partial assistant output and re-open the
+                        // stream from the top, but ONLY for genuine transport
+                        // failures (never 401/402/429/other 4xx/cancel — those
+                        // can't be fixed by reconnecting and would burn budget).
+                        if !self.cancel_token.is_cancelled()
+                            && midstream_reconnects < MAX_MIDSTREAM_RECONNECTS
+                            && is_reconnectable_stream_error(&message)
+                        {
+                            midstream_reconnects = midstream_reconnects.saturating_add(1);
+                            eprintln!(
+                                "[reconnect] mid-stream net error, retry {midstream_reconnects}/{MAX_MIDSTREAM_RECONNECTS}"
+                            );
+                            crate::logging::warn(format!(
+                                "Mid-stream reconnect {midstream_reconnects}/{MAX_MIDSTREAM_RECONNECTS} after network error (discarding partial output): {message}"
+                            ));
+                            let _ = self
+                                .tx_event
+                                .send(Event::status(
+                                    "Connection dropped mid-generation; reconnecting…",
+                                ))
+                                .await;
+
+                            // Finalize any partially-rendered assistant cell so
+                            // the reconnected stream renders fresh instead of
+                            // appending to the pre-drop fragment (mirrors the
+                            // sleep-resume finalize below).
+                            if any_content_received {
+                                if let Some(index) = last_text_index {
+                                    let _ =
+                                        self.tx_event.send(Event::MessageComplete { index }).await;
+                                }
+                            }
+
+                            // Drop the dead stream to release its connection.
+                            drop(stream);
+                            let reconnect_result = tokio::select! {
+                                biased;
+                                () = self.cancel_token.cancelled() => break,
+                                result = client.create_message_stream(stream_request.clone()) => result,
+                            };
+                            match reconnect_result {
+                                Ok(fresh) => {
+                                    stream = fresh;
+                                    // Reset ALL in-memory assistant accumulation
+                                    // so the partial (pre-drop) content is not
+                                    // stitched into the fresh generation. Upstream
+                                    // has no resume token — we collect from the
+                                    // top. Billing stays fair: relay bills
+                                    // post-flight per delivered bytes.
+                                    content_blocks.clear();
+                                    current_text_raw.clear();
+                                    current_text_visible.clear();
+                                    current_thinking.clear();
+                                    current_thinking_signature = None;
+                                    tool_uses.clear();
+                                    current_tool_indices.clear();
+                                    current_block_kind = None;
+                                    in_tool_call_block = false;
+                                    fake_wrapper_notice_emitted = false;
+                                    pending_message_complete = false;
+                                    last_text_index = None;
+                                    pending_steers.clear();
+                                    usage = Usage {
+                                        input_tokens: 0,
+                                        output_tokens: 0,
+                                        ..Usage::default()
+                                    };
+                                    stream_content_bytes = 0;
+                                    any_content_received = false;
+                                    // Fresh stream → fresh wall-clock + progress
+                                    // stamps, and this error never surfaced.
+                                    stream_start = Instant::now();
+                                    last_progress_mono = Instant::now();
+                                    last_progress_wall = std::time::SystemTime::now();
+                                    stream_errors = stream_errors.saturating_sub(1);
+                                    continue;
+                                }
+                                Err(reconnect_err) => {
+                                    // Re-open failed — fall through to the normal
+                                    // failure path with a coded message so the
+                                    // client can distinguish it.
+                                    let reconnect_msg = self.decorate_auth_error_message(format!(
+                                        "Reconnect failed: {reconnect_err}"
+                                    ));
+                                    turn_error.get_or_insert(reconnect_msg.clone());
+                                    let _ = self
+                                        .tx_event
+                                        .send(Event::error(ErrorEnvelope::classify(
+                                            reconnect_msg,
+                                            true,
+                                        )))
+                                        .await;
+                                    break;
+                                }
+                            }
+                        }
+
                         turn_error.get_or_insert(message.clone());
                         let _ = self
                             .tx_event

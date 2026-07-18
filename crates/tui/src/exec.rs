@@ -800,13 +800,15 @@ async fn run_exec_agent_core(
                 envelope,
                 recoverable: _,
             } => {
-                summary.error = Some(envelope.message.clone());
+                // GEN_RELIABILITY_FIX A3: prefix a stable `[CODE]` token so the
+                // client can route user-facing copy precisely (idempotent —
+                // no-ops if already tagged).
+                let coded = crate::error_taxonomy::with_error_code(envelope.message);
+                summary.error = Some(coded.clone());
                 if output_format == ExecOutputFormat::StreamJson {
-                    sink.emit_exec_stream_event(ExecStreamEvent::Error {
-                        error: envelope.message,
-                    })?;
+                    sink.emit_exec_stream_event(ExecStreamEvent::Error { error: coded })?;
                 } else if !json_output {
-                    eprintln!("error: {}", envelope.message);
+                    eprintln!("error: {coded}");
                 }
             }
             Event::TurnComplete {
@@ -816,7 +818,9 @@ async fn run_exec_agent_core(
                 ..
             } => {
                 summary.status = Some(format!("{status:?}").to_lowercase());
-                summary.error = error;
+                // GEN_RELIABILITY_FIX A3: tag the terminal turn error too. This
+                // is the string the client parses off the final ExecOutcome.
+                summary.error = error.map(crate::error_taxonomy::with_error_code);
                 let saved_session_id = if should_persist_session && !latest_messages.is_empty() {
                     match persist_exec_session(
                         &latest_messages,

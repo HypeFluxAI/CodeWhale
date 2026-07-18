@@ -661,10 +661,37 @@ impl DeepSeekClient {
                 "; +https://github.com/Hmbown/CodeWhale)"
             )
         };
+        // GEN_RELIABILITY_FIX A2. Weak mobile networks (NAT rebind / cell
+        // handover / tower switch) drop connections mid-generation. Fail the
+        // *connect* fast on mobile so A1's mid-stream reconnect kicks in
+        // sooner; desktop keeps the longer 30s tolerance.
+        //
+        // `#[cfg(mobile)]` is a Tauri-injected cfg that only exists in the
+        // app crate — in this library crate it would never be set. The
+        // correct always-available signal when CodeWhale is embedded
+        // in-process into the Android/iOS Tauri host (#274/#275) is the
+        // build target OS.
+        #[cfg(any(target_os = "android", target_os = "ios"))]
+        let connect_timeout = Duration::from_secs(15);
+        #[cfg(not(any(target_os = "android", target_os = "ios")))]
+        let connect_timeout = Duration::from_secs(30);
+
         let mut builder = crate::tls::reqwest_client_builder()
             .default_headers(headers)
             .user_agent(user_agent)
-            .connect_timeout(Duration::from_secs(30))
+            .connect_timeout(connect_timeout)
+            // GEN_RELIABILITY_FIX A2. Socket-level read timeout: detects a
+            // "name only" connection (TCP alive but no bytes flowing) far
+            // sooner than the 300s/120s application-layer SSE idle timeout,
+            // so A1 can reconnect instead of hanging. Set to 120s — well
+            // above any realistic silent deep-thinking gap (the upstream
+            // emits `{"choices":[]}` keepalive body chunks that reset this
+            // timer, but HTTP/2 PING frames do NOT produce body bytes, so a
+            // fully silent thinking pause must stay under this bound), and
+            // below the desktop SSE idle so it still trips first on a dead
+            // wire. A read_timeout error now feeds A1 reconnect, not turn
+            // death. See the report for why 120s (not 60s).
+            .read_timeout(Duration::from_secs(120))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Some(Duration::from_secs(15)))
             .http2_keep_alive_timeout(Duration::from_secs(20))
