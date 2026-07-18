@@ -693,7 +693,7 @@ impl DeepSeekClient {
             // keepalive (`http2_keep_alive_timeout`, 20s) below. A read_timeout
             // error now only fires after a genuine 300s silence and feeds A1
             // reconnect, not turn death.
-            .read_timeout(Duration::from_secs(300))
+            .read_timeout(Duration::from_secs(600))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Some(Duration::from_secs(15)))
             .http2_keep_alive_timeout(Duration::from_secs(20))
