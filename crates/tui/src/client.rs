@@ -681,17 +681,19 @@ impl DeepSeekClient {
             .user_agent(user_agent)
             .connect_timeout(connect_timeout)
             // GEN_RELIABILITY_FIX A2. Socket-level read timeout: detects a
-            // "name only" connection (TCP alive but no bytes flowing) far
-            // sooner than the 300s/120s application-layer SSE idle timeout,
-            // so A1 can reconnect instead of hanging. Set to 120s — well
-            // above any realistic silent deep-thinking gap (the upstream
-            // emits `{"choices":[]}` keepalive body chunks that reset this
-            // timer, but HTTP/2 PING frames do NOT produce body bytes, so a
-            // fully silent thinking pause must stay under this bound), and
-            // below the desktop SSE idle so it still trips first on a dead
-            // wire. A read_timeout error now feeds A1 reconnect, not turn
-            // death. See the report for why 120s (not 60s).
-            .read_timeout(Duration::from_secs(120))
+            // "name only" connection (TCP alive but no bytes flowing) so A1
+            // can reconnect instead of hanging. Set to 300s to ALIGN with the
+            // app-layer SSE idle (`stream_chunk_timeout_secs`, 300s): DeepSeek
+            // V4 reasoning can "think" silently for well over 120s on large
+            // contexts, emitting no body bytes (HTTP/2 PING keepalive frames
+            // do NOT reset this read timer). A 120s socket timeout tripped
+            // mid-thinking → spurious `[NET_STALL]` → mid-stream reconnect
+            // thrash that discarded and restarted the whole 24k-token gen.
+            // True dead-wire detection is still covered by the HTTP/2
+            // keepalive (`http2_keep_alive_timeout`, 20s) below. A read_timeout
+            // error now only fires after a genuine 300s silence and feeds A1
+            // reconnect, not turn death.
+            .read_timeout(Duration::from_secs(300))
             .tcp_keepalive(Some(Duration::from_secs(30)))
             .http2_keep_alive_interval(Some(Duration::from_secs(15)))
             .http2_keep_alive_timeout(Duration::from_secs(20))

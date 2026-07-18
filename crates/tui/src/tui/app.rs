@@ -5492,8 +5492,10 @@ mod tests {
 
         assert!(app.auto_compact);
         assert!(!app.auto_compact_user_configured);
-        assert_eq!(app.auto_compact_threshold_percent, 80.0);
-        assert_eq!(app.compact_threshold, 209_715);
+        // #324: default percent lowered 80 -> 65. trinity is a 262144 non-V4
+        // window (uncapped), so 65% = 170_393.
+        assert_eq!(app.auto_compact_threshold_percent, 65.0);
+        assert_eq!(app.compact_threshold, 170_394);
     }
 
     #[test]
@@ -5511,7 +5513,8 @@ mod tests {
 
         assert!(!app.auto_compact);
         assert!(app.auto_compact_user_configured);
-        assert_eq!(app.compact_threshold, 209_715);
+        // #324: percent default 80 -> 65; trinity 262144 window at 65%.
+        assert_eq!(app.compact_threshold, 170_394);
     }
 
     #[test]

@@ -326,11 +326,16 @@ impl Default for Settings {
         Self {
             // Keep the persisted fallback `false`; startup code may enable
             // auto-compaction by model window when the user has not saved an
-            // explicit preference. V4-class 1M-token models stay opt-in to
-            // preserve prefix-cache behavior, while 256K-class models default
-            // on at the configured percent threshold.
+            // explicit preference (see `auto_compact_default_for_model`). The
+            // served DeepSeek-V4 window is ~64K (not the advertised 1M), so V4
+            // now defaults auto-compaction ON via the served-window helper.
             auto_compact: false,
-            auto_compact_threshold_percent: 80.0,
+            // 65% (was 80%): against the served ~64K V4 window this fires
+            // compaction around ~42K running tokens, leaving headroom under
+            // ~64K for the system prompt + the new turn + the response. 80%
+            // (~52K) left too little room once the request framing + reply were
+            // added on top.
+            auto_compact_threshold_percent: 65.0,
             calm_mode: false,
             tool_collapse_mode: "compact".to_string(),
             low_motion: false,
@@ -1347,7 +1352,9 @@ mod tests {
         // flipped so the cache-friendly path is the one users get
         // without configuring anything (#664).
         assert!(!settings.auto_compact);
-        assert_eq!(settings.auto_compact_threshold_percent, 80.0);
+        // #324: lowered 80 -> 65 so compaction fires ~42K against the served
+        // ~64K V4 window, leaving headroom for the new turn + response.
+        assert_eq!(settings.auto_compact_threshold_percent, 65.0);
     }
 
     #[test]

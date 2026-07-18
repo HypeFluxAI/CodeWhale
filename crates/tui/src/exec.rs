@@ -126,6 +126,14 @@ pub enum ExecStreamEvent {
     Done,
     #[serde(rename = "error")]
     Error { error: String },
+    /// GEN_RELIABILITY_FIX. Lightweight liveness signal emitted while the model
+    /// is streaming reasoning (`ThinkingDelta`) or text (`MessageDelta`) but has
+    /// not yet produced a tool-call or file-write. The host app uses it to poke
+    /// its idle watchdog so a long silent-thinking gap (DeepSeek V4 reasoning on
+    /// large contexts) is not mistaken for a hang. Throttled (see exec loop);
+    /// does NOT change what text is delivered to the final work.
+    #[serde(rename = "heartbeat")]
+    Heartbeat { phase: &'static str },
 }
 
 /// Where stream-json events go: the CLI prints one JSON line per event to
@@ -636,6 +644,25 @@ async fn run_exec_agent_core(
 
     let mut stdout = io::stdout();
     let mut ends_with_newline = false;
+    // GEN_RELIABILITY_FIX. Throttle for the liveness `Heartbeat` events emitted
+    // during silent thinking / text streaming. We coalesce so we emit at most
+    // ~one per second no matter how many token deltas arrive — enough to keep
+    // the host watchdog fed, without spamming one event per token.
+    let mut last_heartbeat = std::time::Instant::now()
+        .checked_sub(std::time::Duration::from_secs(1))
+        .unwrap_or_else(std::time::Instant::now);
+    const HEARTBEAT_MIN_GAP: std::time::Duration = std::time::Duration::from_millis(1000);
+    let maybe_heartbeat =
+        |sink: &ExecEventSink, phase: &'static str, last: &mut std::time::Instant| {
+            if output_format != ExecOutputFormat::StreamJson {
+                return Ok(());
+            }
+            if last.elapsed() < HEARTBEAT_MIN_GAP {
+                return Ok(());
+            }
+            *last = std::time::Instant::now();
+            sink.emit_exec_stream_event(ExecStreamEvent::Heartbeat { phase })
+        };
     loop {
         let event = {
             let mut rx = engine_handle.rx_event.write().await;
@@ -662,6 +689,11 @@ async fn run_exec_agent_core(
             Event::MessageDelta { content, .. } => {
                 summary.output.push_str(&content);
                 if output_format == ExecOutputFormat::StreamJson {
+                    // GEN_RELIABILITY_FIX: keep the host watchdog alive during
+                    // text streaming too (not just on tools/files). The Content
+                    // event itself already reaches the host, but emit a throttled
+                    // heartbeat as a uniform liveness signal alongside it.
+                    maybe_heartbeat(&sink, "text", &mut last_heartbeat)?;
                     sink.emit_exec_stream_event(ExecStreamEvent::Content { content })?;
                 } else if !json_output {
                     print!("{content}");
@@ -677,8 +709,13 @@ async fn run_exec_agent_core(
                 println!();
             }
             Event::ThinkingDelta { .. } => {
-                // Exec stream-json intentionally omits reasoning deltas; the
-                // TUI transcript retains its existing Activity Detail surface.
+                // Exec stream-json intentionally omits reasoning deltas from the
+                // work text; the TUI transcript retains its existing Activity
+                // Detail surface. GEN_RELIABILITY_FIX: but we DO emit a throttled
+                // liveness heartbeat so the host watchdog sees the model is alive
+                // during a long silent-thinking gap (V4 reasoning) — otherwise a
+                // tool-only watchdog fires 210s into a healthy thinking pause.
+                maybe_heartbeat(&sink, "thinking", &mut last_heartbeat)?;
             }
             Event::ToolCallStarted { id, name, input } => {
                 if output_format == ExecOutputFormat::StreamJson {

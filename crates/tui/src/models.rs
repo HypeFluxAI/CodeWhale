@@ -6,6 +6,29 @@ use serde::{Deserialize, Serialize};
 /// newer V4 alias and do not carry an explicit `*k` suffix.
 pub const LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS: u32 = 128_000;
 pub const DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS: u32 = 1_000_000;
+
+/// Real usable context window of the DeepSeek-V4 model as **served in
+/// production** via the ThinkAI relay (`api.thinkai.school`,
+/// OpenAI-compatible). The upstream `deepseek-v4-*` family advertises a 1M
+/// window ([`DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS`], still used for
+/// provider-capability / max-output math), but the served deployment only
+/// admits on the order of ~64K tokens before quality collapses and each turn
+/// has to reprocess the whole balloon — production relay logs showed input
+/// context climbing past `in=54130` and still growing with no compaction ever
+/// firing.
+///
+/// Compaction thresholds for the V4 family are derived from THIS value, not
+/// the 1M advertised window, so automatic compaction fires well before the
+/// served model maxes out. `compaction_threshold_for_model_at_percent` at the
+/// default 80% yields ~52K here; the shipped default percent is lowered to
+/// 65% (see `settings.rs`) so compaction fires around ~42K — leaving headroom
+/// under ~64K for the system prompt + the new turn + the model's response.
+///
+/// This is intentionally scoped to compaction only: if a genuinely
+/// larger-context V4 (or any other model with a truthful window) is served
+/// later, the derivation still scales from the real window and this cap only
+/// ever shrinks — it never inflates a small window.
+pub const DEEPSEEK_V4_SERVED_CONTEXT_WINDOW_TOKENS: u32 = 64_000;
 /// Last-resort compaction trigger when [`context_window_for_model`] returns
 /// `None` (an unrecognised model id). v0.8.11 raised this from `50_000` to
 /// `102_400` (80% of [`LEGACY_DEEPSEEK_CONTEXT_WINDOW_TOKENS`]) so unknown
@@ -401,11 +424,30 @@ fn explicit_context_window_hint(model_lower: &str) -> Option<u32> {
     None
 }
 
+/// Context window to use **for compaction math only**.
+///
+/// Identical to [`context_window_for_model`] except the DeepSeek-V4 family is
+/// capped at [`DEEPSEEK_V4_SERVED_CONTEXT_WINDOW_TOKENS`] (the real ~64K window
+/// served in production), instead of the 1M window the upstream model
+/// advertises. Compaction must key off the window the served endpoint can
+/// actually accept, or old tool results (large HTML file bodies, tool output)
+/// accumulate forever and never trigger the summarizer. Non-V4 models pass
+/// through unchanged so a truthful larger window still scales normally.
+#[must_use]
+pub fn compaction_context_window_for_model(model: &str) -> Option<u32> {
+    let window = context_window_for_model(model)?;
+    if model.to_lowercase().contains("v4") {
+        Some(window.min(DEEPSEEK_V4_SERVED_CONTEXT_WINDOW_TOKENS))
+    } else {
+        Some(window)
+    }
+}
+
 /// Derive a compaction token threshold from model context and a caller-supplied
 /// percentage.
 #[must_use]
 pub fn compaction_threshold_for_model_at_percent(model: &str, percent: f64) -> usize {
-    let Some(window) = context_window_for_model(model) else {
+    let Some(window) = compaction_context_window_for_model(model) else {
         return DEFAULT_COMPACTION_TOKEN_THRESHOLD;
     };
 
@@ -425,7 +467,11 @@ pub fn compaction_threshold_for_model_at_percent(model: &str, percent: f64) -> u
 /// relief near the context wall.
 #[must_use]
 pub fn auto_compact_default_for_model(model: &str) -> bool {
-    context_window_for_model(model)
+    // Use the compaction (served) window: the V4 family advertises 1M but is
+    // served at ~64K, so it MUST default auto-compaction on — otherwise a long
+    // "继续/continue" session grows unbounded and eventually times out the
+    // model (see `DEEPSEEK_V4_SERVED_CONTEXT_WINDOW_TOKENS`).
+    compaction_context_window_for_model(model)
         .is_some_and(|window| window <= DEFAULT_AUTO_COMPACT_MAX_CONTEXT_WINDOW_TOKENS)
 }
 
@@ -690,18 +736,33 @@ mod tests {
     }
 
     #[test]
-    fn compaction_scales_for_deepseek_v4_1m_context() {
+    fn compaction_uses_served_window_for_deepseek_v4() {
+        // #324: V4 advertises a 1M window but is served at ~64K on the ThinkAI
+        // relay. Compaction derives from the served window
+        // (`DEEPSEEK_V4_SERVED_CONTEXT_WINDOW_TOKENS`), NOT the 1M advertised
+        // value, so the trigger actually fires on long sessions. 80% of 64K.
         assert_eq!(
             compaction_threshold_for_model_at_percent("deepseek-v4-pro", 80.0),
-            800_000
+            51_200
+        );
+        // The compaction window helper caps V4 at the served value while
+        // leaving the advertised window untouched for capability/output math.
+        assert_eq!(
+            compaction_context_window_for_model("deepseek-v4-pro"),
+            Some(DEEPSEEK_V4_SERVED_CONTEXT_WINDOW_TOKENS)
+        );
+        assert_eq!(
+            context_window_for_model("deepseek-v4-pro"),
+            Some(DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS)
         );
     }
 
     #[test]
     fn compaction_threshold_honors_configured_percent() {
+        // 75% of the served ~64K V4 window (#324), not the 1M advertised one.
         assert_eq!(
             compaction_threshold_for_model_at_percent("deepseek-v4-pro", 75.0),
-            750_000
+            48_000
         );
         assert_eq!(
             compaction_threshold_for_model_at_percent("trinity-large-thinking", 80.0),
@@ -713,7 +774,9 @@ mod tests {
     fn auto_compaction_defaults_on_for_256k_class_models_only() {
         assert!(auto_compact_default_for_model("trinity-large-thinking"));
         assert!(auto_compact_default_for_model("deepseek-v3.2-128k"));
-        assert!(!auto_compact_default_for_model("deepseek-v4-pro"));
+        // #324: V4's served window is ~64K, so auto-compaction now defaults ON
+        // (was OFF when it keyed off the advertised 1M window).
+        assert!(auto_compact_default_for_model("deepseek-v4-pro"));
         assert!(!auto_compact_default_for_model("mimo-v2.5-pro"));
         assert!(!auto_compact_default_for_model("unknown-model"));
     }
