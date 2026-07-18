@@ -939,55 +939,94 @@ pub async fn compact_messages_safe(
     const MAX_RETRIES: u32 = 3;
     const BASE_DELAY_MS: u64 = 1000;
 
-    let was_over_threshold = should_compact(
-        messages,
-        config,
-        workspace,
-        external_pins,
-        external_working_set_paths,
-    );
-    let mut pruned_messages = messages.to_vec();
-    let mut now_under_threshold = false;
-    let mut next_stop_check_bytes = 0usize;
-    let pruned_bytes = prune_tool_results_until(
-        &mut pruned_messages,
-        KEEP_RECENT_MESSAGES,
-        |candidate_messages, bytes_saved| {
-            if !was_over_threshold || bytes_saved < next_stop_check_bytes {
-                return false;
-            }
+    // GEN_RELIABILITY_FIX (mobile compaction stall, #329): the local
+    // tool-result prune below is a long *synchronous, CPU-bound* section with
+    // NO `.await` inside it. `prune_tool_results_until` loops over the whole
+    // (potentially multi-MB) context, and its `should_stop` closure runs a
+    // full `should_compact` compaction-plan pass (regex-scanning every message,
+    // an O(n) `enforce_tool_call_pairs` fixpoint) repeatedly. On a large V4
+    // context this can run for many seconds/minutes.
+    //
+    // The turn_loop caller wraps this future in a `tokio::select!` with a 20s
+    // `interval` that is supposed to emit periodic heartbeats to the host idle
+    // watchdog. But `select!` only polls the interval branch at an `.await`
+    // point in THIS future — while the sync prune runs, the future never yields,
+    // the interval can never tick, no heartbeat is sent, and the host watchdog
+    // (`IDLE_TIMEOUT`) fires with `[NET_STALL]`. `block_in_place` would NOT help
+    // (it blocks the same task, so the sibling interval branch still can't be
+    // polled). Moving the CPU work to `spawn_blocking` is what actually lets the
+    // future `.await` the join handle → yield → the interval fires. Tauri runs a
+    // multi-thread tokio runtime, so the blocking work lands on a blocking-pool
+    // thread and the runtime worker stays live.
+    let owned_messages = messages.to_vec();
+    let config_owned = config.clone();
+    let workspace_owned = workspace.map(Path::to_path_buf);
+    let external_pins_owned = external_pins.map(<[usize]>::to_vec);
+    let external_working_set_paths_owned = external_working_set_paths.map(<[String]>::to_vec);
 
-            // Stop at the first suffix-side prune check that clears the threshold.
-            // The check itself is a full compaction-plan pass, so bound it by saved
-            // bytes instead of running it after every candidate in huge sessions.
-            next_stop_check_bytes = bytes_saved.saturating_add(TOOL_PRUNE_STOP_CHECK_BYTES);
-            now_under_threshold = !should_compact(
-                candidate_messages,
-                config,
-                workspace,
-                external_pins,
-                external_working_set_paths,
+    let (pruned_messages, pruned_bytes, now_under_threshold) =
+        tokio::task::spawn_blocking(move || {
+            let workspace_ref = workspace_owned.as_deref();
+            let external_pins_ref = external_pins_owned.as_deref();
+            let external_working_set_paths_ref = external_working_set_paths_owned.as_deref();
+
+            let was_over_threshold = should_compact(
+                &owned_messages,
+                &config_owned,
+                workspace_ref,
+                external_pins_ref,
+                external_working_set_paths_ref,
             );
-            now_under_threshold
-        },
-    );
-    if was_over_threshold && pruned_bytes > 0 && !now_under_threshold {
-        // The throttled in-loop check may skip the exact candidate that clears the
-        // budget. Do one final pass so a successful local prune still avoids LLM compaction.
-        now_under_threshold = !should_compact(
-            &pruned_messages,
-            config,
-            workspace,
-            external_pins,
-            external_working_set_paths,
-        );
-    }
+            let mut pruned_messages = owned_messages;
+            let mut now_under_threshold = false;
+            let mut next_stop_check_bytes = 0usize;
+            let pruned_bytes = prune_tool_results_until(
+                &mut pruned_messages,
+                KEEP_RECENT_MESSAGES,
+                |candidate_messages, bytes_saved| {
+                    if !was_over_threshold || bytes_saved < next_stop_check_bytes {
+                        return false;
+                    }
+
+                    // Stop at the first suffix-side prune check that clears the threshold.
+                    // The check itself is a full compaction-plan pass, so bound it by saved
+                    // bytes instead of running it after every candidate in huge sessions.
+                    next_stop_check_bytes =
+                        bytes_saved.saturating_add(TOOL_PRUNE_STOP_CHECK_BYTES);
+                    now_under_threshold = !should_compact(
+                        candidate_messages,
+                        &config_owned,
+                        workspace_ref,
+                        external_pins_ref,
+                        external_working_set_paths_ref,
+                    );
+                    now_under_threshold
+                },
+            );
+            if was_over_threshold && pruned_bytes > 0 && !now_under_threshold {
+                // The throttled in-loop check may skip the exact candidate that clears the
+                // budget. Do one final pass so a successful local prune still avoids LLM compaction.
+                now_under_threshold = !should_compact(
+                    &pruned_messages,
+                    &config_owned,
+                    workspace_ref,
+                    external_pins_ref,
+                    external_working_set_paths_ref,
+                );
+            }
+            (pruned_messages, pruned_bytes, now_under_threshold)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("compaction prune task panicked/cancelled: {e}"))?;
 
     let compaction_input: &[Message] = if pruned_bytes > 0 {
         logging::info(format!(
             "Local tool-result prune saved {pruned_bytes} bytes before LLM compaction"
         ));
-        if was_over_threshold && now_under_threshold {
+        // `now_under_threshold` can only be true when the context was over the
+        // threshold to begin with (it is initialized false and set only inside
+        // `was_over_threshold`-gated branches), so it already implies it.
+        if now_under_threshold {
             return Ok(CompactionResult {
                 messages: pruned_messages,
                 summary_prompt: None,
