@@ -41,14 +41,23 @@ pub const MIN_SUBAGENT_HEARTBEAT_TIMEOUT_SECS: u64 = 30;
 pub const MAX_SUBAGENT_HEARTBEAT_TIMEOUT_SECS: u64 = 3600;
 /// Default per-SSE-chunk idle timeout, in seconds.
 ///
-/// GEN_RELIABILITY_FIX A2: mobile (Android/iOS) defaults to a shorter 120s
-/// idle so a "name only" dead connection is detected sooner and handed to
-/// A1's mid-stream reconnect instead of hanging for the full 300s. Desktop
-/// keeps 300s (long V4 thinking turns legitimately pause between chunks and
-/// desktop networks don't silently drop the way cellular does). Explicit
-/// `[tui].stream_chunk_timeout_secs` config still overrides on both.
+/// GEN_RELIABILITY_FIX A2 (revised 2026-07-18 after prod NET_STALL on mobile):
+/// mobile (Android/iOS) app-layer SSE idle. Was 120s — too aggressive. A
+/// genuinely dead cellular wire is already caught in ~20s by the HTTP/2
+/// keepalive (`http2_keep_alive_timeout`, client.rs) and surfaces as
+/// `[NET_RESET]` (A1-reconnectable). The 120s idle therefore only fired on the
+/// "alive-but-mute" case (TCP/NAT alive, keepalive answered, zero body bytes) —
+/// frequently a transient NAT rebind / tower handover that RESUMES on the same
+/// stream if given more time. At 120s it instead tripped `[NET_STALL]` and A1
+/// *restarts* the turn (no resume token) → on a still-settling wire it stalled
+/// again, exhausted the reconnect budget, and killed a fast-progressing gen
+/// (prod: user hit this after ~15 successful sub-1s turns). Raised to 240s so a
+/// transient mute has 4 min to clear on the existing stream before we discard
+/// progress. Still well under the 600s socket `read_timeout` and 30-min
+/// wall-clock cap; the 600s frontend watchdog is the ultimate backstop. Desktop
+/// keeps 300s. Explicit `[tui].stream_chunk_timeout_secs` overrides both.
 #[cfg(any(target_os = "android", target_os = "ios"))]
-pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 120;
+pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 240;
 /// Default per-SSE-chunk idle timeout, in seconds (desktop).
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub const DEFAULT_STREAM_CHUNK_TIMEOUT_SECS: u64 = 300;
