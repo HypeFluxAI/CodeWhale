@@ -139,16 +139,46 @@ impl Engine {
                     .send(Event::status("Auto-compacting context...".to_string()))
                     .await;
                 let auto_messages_before = self.session.messages.len();
-                match compact_messages_safe(
-                    &client,
-                    &self.session.messages,
-                    &self.config.compaction,
-                    Some(&self.session.workspace),
-                    Some(&compaction_pins),
-                    Some(&compaction_paths),
-                )
-                .await
-                {
+                // GEN_RELIABILITY_FIX (mobile compaction stall): CompactionStarted
+                // above fires ONCE, but compact_messages_safe (heavy local prune +
+                // summarization LLM call) can then run >150s emitting nothing the
+                // host watchdog sees → the host kills a healthy engine mid-compaction.
+                // Drive a periodic Status tick every ~20s until compaction resolves so
+                // there is a sub-150s liveness cadence through the whole silent phase.
+                // Each tick maps (in exec.rs) to a host heartbeat. Pin the future so
+                // select! doesn't drop/restart it across iterations.
+                // Scope the pinned future + its borrows (&self.session.messages,
+                // &self.config.compaction, &self.session.workspace) to this block so
+                // it is DROPPED before the match arms below need `&mut self`. The
+                // resolved `CompactionResult` is owned, so it outlives the borrows.
+                let compaction_outcome = {
+                    let compaction_fut = compact_messages_safe(
+                        &client,
+                        &self.session.messages,
+                        &self.config.compaction,
+                        Some(&self.session.workspace),
+                        Some(&compaction_pins),
+                        Some(&compaction_paths),
+                    );
+                    tokio::pin!(compaction_fut);
+                    let mut compaction_tick =
+                        tokio::time::interval(Duration::from_secs(20));
+                    // First tick fires immediately; skip it (we already emitted a
+                    // "started" Status above) so the next tick is a real ~20s cadence.
+                    compaction_tick.tick().await;
+                    loop {
+                        tokio::select! {
+                            outcome = &mut compaction_fut => break outcome,
+                            _ = compaction_tick.tick() => {
+                                let _ = self
+                                    .tx_event
+                                    .send(Event::status("Auto-compacting context…"))
+                                    .await;
+                            }
+                        }
+                    }
+                };
+                match compaction_outcome {
                     Ok(result) => {
                         // Only update if we got valid messages (never corrupt state)
                         if !result.messages.is_empty() || self.session.messages.is_empty() {

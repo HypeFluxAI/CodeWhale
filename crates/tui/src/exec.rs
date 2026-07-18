@@ -936,6 +936,21 @@ async fn run_exec_agent_core(
             {
                 eprintln!("{message}");
             }
+            // GEN_RELIABILITY_FIX (mobile compaction stall): auto-compaction runs
+            // a heavy local prune loop + a summarization LLM call that can burn
+            // >150s emitting NO event the host watchdog recognizes — so the host
+            // kills a healthy, busy engine mid-compaction. Map compaction lifecycle
+            // + generic status events to a throttled liveness heartbeat (reusing the
+            // shared HEARTBEAT_MIN_GAP helper) so the host's idle watchdog stays fed
+            // through the whole silent compaction window. turn_loop.rs also emits a
+            // periodic Status tick every ~20s during compaction, and each such tick
+            // lands here → heartbeat.
+            Event::CompactionStarted { .. }
+            | Event::CompactionCompleted { .. }
+            | Event::CompactionFailed { .. }
+            | Event::Status { .. } => {
+                maybe_heartbeat(&sink, "compaction", &mut last_heartbeat)?;
+            }
             _ => {}
         }
     }
