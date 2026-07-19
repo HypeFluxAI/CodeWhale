@@ -105,11 +105,26 @@ impl Engine {
             self.refresh_system_prompt();
 
             if turn.at_max_steps() {
+                // #329: 步数用尽不能静默 break（原来只发 status → turn 返回
+                // Completed 却没产出 → 前端"装死"）。改成设 turn_error + 发
+                // 稳定码 MAX_STEPS 的 Event::error，让 turn 走 :2476 的 Failed
+                // 分支，前端能识别为明确错误并给友好文案。
+                let message = format!(
+                    "[MAX_STEPS] 步数用尽({}), 任务太大一轮没做完",
+                    turn.max_steps
+                );
+                turn_error = Some(message.clone());
                 let _ = self
                     .tx_event
-                    .send(Event::status("Reached maximum steps"))
+                    .send(Event::error(ErrorEnvelope::new(
+                        ErrorCategory::InvalidInput,
+                        ErrorSeverity::Error,
+                        true,
+                        "MAX_STEPS",
+                        message,
+                    )))
                     .await;
-                break;
+                return (TurnOutcomeStatus::Failed, turn_error);
             }
 
             let compaction_pins = self
@@ -1485,11 +1500,23 @@ impl Engine {
                         !pending_steers.is_empty(),
                         holding_for_subagents,
                     ) {
-                        let message = "Model returned reasoning but no answer or tool call; \
-                                       turn ended without output. Send a follow-up to retry."
+                        // #329: "只思考没产出" 同样不能只发 status（被 StreamJson
+                        // 当心跳丢弃 → 前端看不到 → 装死）。发稳定码 NO_OUTPUT 的
+                        // Event::error 并设 turn_error，让 turn 返回 Failed。
+                        let message = "[NO_OUTPUT] 模型只思考没产出（无答复也无工具调用）"
                             .to_string();
                         crate::logging::warn(&message);
-                        let _ = self.tx_event.send(Event::status(message)).await;
+                        turn_error = Some(message.clone());
+                        let _ = self
+                            .tx_event
+                            .send(Event::error(ErrorEnvelope::new(
+                                ErrorCategory::Internal,
+                                ErrorSeverity::Error,
+                                true,
+                                "NO_OUTPUT",
+                                message,
+                            )))
+                            .await;
                     }
                 }
 
