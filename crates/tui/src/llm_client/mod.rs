@@ -1064,7 +1064,20 @@ where
                 // Use server's Retry-After if available and configured
                 let base_delay = config.delay_for_attempt(attempt);
                 let delay = if config.respect_retry_after {
-                    err.suggested_retry_delay().unwrap_or(base_delay)
+                    match err.suggested_retry_delay() {
+                        // A server-requested wait longer than our own cap is not a transient
+                        // hiccup (e.g. a weekly quota wall: Retry-After ≈ 3 days). Sleeping would
+                        // hang the caller for days; fail now so the server's message is shown.
+                        Some(wait) if wait.as_secs_f64() > config.max_delay => {
+                            return Err(RetryError {
+                                last_error: err,
+                                attempts: attempt + 1,
+                                total_time: start_time.elapsed(),
+                            });
+                        }
+                        Some(wait) => wait,
+                        None => base_delay,
+                    }
                 } else {
                     base_delay
                 };
@@ -1568,6 +1581,70 @@ mod tests {
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), 42);
         assert_eq!(call_count, 1);
+    }
+
+    // A Retry-After longer than our own max_delay (e.g. a weekly quota wall: "back in ~3 days")
+    // must fail fast instead of sleeping for days — the caller has to surface the message.
+    #[tokio::test]
+    async fn test_with_retry_fails_fast_when_retry_after_exceeds_max_delay() {
+        let config = RetryConfig::default(); // max_delay = 60s
+        let mut call_count = 0;
+        let started = Instant::now();
+
+        let result: RetryResult<i32> = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_retry(
+                &config,
+                || {
+                    call_count += 1;
+                    async {
+                        Err(LlmError::RateLimited {
+                            message: "本周额度用完啦, 约 3 天后自动恢复".to_string(),
+                            retry_after: Some(Duration::from_secs(3 * 24 * 3600)),
+                        })
+                    }
+                },
+                None,
+            ),
+        )
+        .await
+        .expect("with_retry must not sleep for a multi-day Retry-After");
+
+        let err = result.expect_err("should give up immediately");
+        assert_eq!(call_count, 1);
+        assert_eq!(err.attempts, 1);
+        assert!(matches!(err.last_error, LlmError::RateLimited { .. }));
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    // A short Retry-After within max_delay is still honoured (transient rate limit).
+    #[tokio::test]
+    async fn test_with_retry_honours_short_retry_after() {
+        let config = RetryConfig::default().with_jitter(false);
+        let mut call_count = 0;
+
+        let result = with_retry(
+            &config,
+            || {
+                call_count += 1;
+                let n = call_count;
+                async move {
+                    if n == 1 {
+                        Err(LlmError::RateLimited {
+                            message: "slow down".to_string(),
+                            retry_after: Some(Duration::from_secs(2)),
+                        })
+                    } else {
+                        Ok(7)
+                    }
+                }
+            },
+            None,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), 7);
+        assert_eq!(call_count, 2);
     }
 
     #[tokio::test]
