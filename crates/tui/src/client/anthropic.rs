@@ -300,6 +300,21 @@ fn message_to_anthropic(message: &crate::models::Message) -> Option<Value> {
     Some(json!({ "role": message.role, "content": blocks }))
 }
 
+/// Anthropic's `url` image source only accepts http(s); `data:` URLs (what
+/// `exec --image` produces) must be sent as a base64 source instead.
+fn anthropic_image_source(url: &str) -> Value {
+    if let Some(rest) = url.strip_prefix("data:")
+        && let Some((meta, data)) = rest.split_once(',')
+        && let Some(media_type) = meta.strip_suffix(";base64")
+    {
+        return json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media_type, "data": data },
+        });
+    }
+    json!({ "type": "image", "source": { "type": "url", "url": url } })
+}
+
 fn content_block_to_anthropic(block: &ContentBlock) -> Option<Value> {
     match block {
         ContentBlock::Text {
@@ -352,10 +367,7 @@ fn content_block_to_anthropic(block: &ContentBlock) -> Option<Value> {
             }
             Some(value)
         }
-        ContentBlock::ImageUrl { image_url } => Some(json!({
-            "type": "image",
-            "source": { "type": "url", "url": image_url.url },
-        })),
+        ContentBlock::ImageUrl { image_url } => Some(anthropic_image_source(&image_url.url)),
         // Server-tool block types are DeepSeek/internal concepts with no
         // Anthropic client-side wire equivalent.
         ContentBlock::ServerToolUse { .. }
@@ -551,6 +563,17 @@ fn anthropic_error_fields(error: &Value) -> (String, String) {
 mod tests {
     use super::*;
     use crate::models::{CacheControl, Message, SystemBlock, SystemPrompt, Tool};
+
+    #[test]
+    fn data_url_images_become_base64_sources() {
+        let v = anthropic_image_source("data:image/png;base64,AQID");
+        assert_eq!(v["source"]["type"], "base64");
+        assert_eq!(v["source"]["media_type"], "image/png");
+        assert_eq!(v["source"]["data"], "AQID");
+        let u = anthropic_image_source("https://example.com/a.png");
+        assert_eq!(u["source"]["type"], "url");
+        assert_eq!(u["source"]["url"], "https://example.com/a.png");
+    }
 
     fn request_with(
         model: &str,

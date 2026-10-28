@@ -42,6 +42,10 @@ pub enum Op {
         /// `ToolCallBefore` hooks may deny a tool call with exit code 2.
         hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
         verbosity: Option<String>,
+        /// Images attached to this user turn, as `data:<mime>;base64,…` URLs.
+        /// Sent to the model as `image_url` parts after the text. Empty for
+        /// text-only turns (every caller except `exec --image`).
+        images: Vec<String>,
     },
 
     /// Execute a user-submitted composer shell command (`! <command>`) without

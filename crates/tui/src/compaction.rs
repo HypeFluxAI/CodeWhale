@@ -615,8 +615,9 @@ fn estimate_tokens_for_message(message: &Message, include_thinking: bool) -> usi
             ContentBlock::ToolResult { content, .. } => content.len() / 4,
             ContentBlock::ServerToolUse { .. }
             | ContentBlock::ToolSearchToolResult { .. }
-            | ContentBlock::CodeExecutionToolResult { .. }
-            | ContentBlock::ImageUrl { .. } => 0,
+            | ContentBlock::CodeExecutionToolResult { .. } => 0,
+            // base64 isn't billed as text; providers charge roughly 1-2k tokens per image
+            ContentBlock::ImageUrl { .. } => 1_600,
         })
         .sum::<usize>()
 }

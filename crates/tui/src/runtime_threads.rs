@@ -1709,6 +1709,7 @@ impl RuntimeThreadManager {
                     crate::tui::approval::ApprovalMode::Suggest
                 },
                 verbosity: self.config.verbosity.clone(),
+                images: Vec::new(),
             })
             .await
             .map_err(|e| anyhow!("Failed to start turn: {e}"))?;

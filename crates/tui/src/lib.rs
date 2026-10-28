@@ -363,6 +363,10 @@ struct ExecArgs {
     /// Extra text appended to the system prompt for this run.
     #[arg(long)]
     append_system_prompt: Option<String>,
+    /// Attach an image (PNG/JPEG/GIF/WebP) to the prompt; repeatable. Sent to
+    /// the model as an `image_url` part, so the model must accept images.
+    #[arg(long = "image", value_name = "PATH")]
+    images: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -984,7 +988,8 @@ pub async fn cli_main() -> Result<()> {
                     || args.max_turns.is_some()
                     || args.allowed_tools.is_some()
                     || args.disallowed_tools.is_some()
-                    || args.append_system_prompt.is_some();
+                    || args.append_system_prompt.is_some()
+                    || !args.images.is_empty();
                 if needs_engine {
                     let max_subagents = cli.max_subagents.map_or_else(
                         || config.max_subagents(),
@@ -1017,6 +1022,7 @@ pub async fn cli_main() -> Result<()> {
                         allowed_tools,
                         disallowed_tools,
                         args.append_system_prompt.clone(),
+                        args.images.clone(),
                     )
                     .await
                 } else if args.json {
@@ -1278,6 +1284,7 @@ async fn run_swebench_command(
                 None,
                 None,
                 None,
+                Vec::new(),
             )
             .await?;
 
@@ -6104,6 +6111,24 @@ mod terminal_mode_tests {
         assert_eq!(args.max_turns, Some(7));
         assert_eq!(args.append_system_prompt.as_deref(), Some("extra rules"));
         assert_eq!(args.prompt, vec!["do the thing"]);
+    }
+
+    #[test]
+    fn exec_parses_repeatable_image_flag() {
+        let cli = parse_cli(&[
+            "codewhale",
+            "exec",
+            "--image",
+            "a.png",
+            "--image",
+            "b.jpg",
+            "use these",
+        ]);
+        let Some(Commands::Exec(args)) = cli.command else {
+            panic!("expected exec command");
+        };
+        assert_eq!(args.images, vec![PathBuf::from("a.png"), PathBuf::from("b.jpg")]);
+        assert_eq!(args.prompt, vec!["use these"]);
     }
 
     #[test]

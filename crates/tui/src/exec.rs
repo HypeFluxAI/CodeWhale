@@ -288,6 +288,8 @@ pub struct ExecRequest {
     /// iOS sandbox. `None` keeps current behavior. Note: this installs a
     /// process-wide override (see `codewhale_config::set_codewhale_home_override`).
     pub state_dir: Option<PathBuf>,
+    /// Images attached to the prompt (the CLI's repeatable `--image`).
+    pub images: Vec<PathBuf>,
 }
 
 /// Run one exec-agent turn in-process.
@@ -353,10 +355,49 @@ pub async fn run_exec(
         allowed_tools,
         disallowed_tools,
         req.append_system_prompt.clone(),
+        req.images.clone(),
         &ExecEventSink::Channel(events),
         &cancel,
     )
     .await
+}
+
+/// Encode an attached image as a `data:` URL for an `image_url` part.
+fn image_data_url(path: &std::path::Path) -> Result<String> {
+    use base64::Engine as _;
+    // Images ride along on every request of the agent loop, and providers
+    // cap a single image at ~5 MB *encoded* (base64 grows data by 4/3), so
+    // keep the raw file under 3.75 MB and fail early with a clear error.
+    const MAX_IMAGE_BYTES: u64 = 3_750_000;
+    let len = std::fs::metadata(path)
+        .with_context(|| format!("could not read image {}", path.display()))?
+        .len();
+    if len > MAX_IMAGE_BYTES {
+        bail!(
+            "image {} is {} bytes; the limit is 3.75 MB (5 MB once encoded) — downscale it first",
+            path.display(),
+            len
+        );
+    }
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("could not read image {}", path.display()))?;
+    // Declare the type the bytes actually are (a JPEG saved as .png would be
+    // rejected by providers that check the declared media type).
+    let mime = if bytes.starts_with(&[0x89, b'P', b'N', b'G']) {
+        "image/png"
+    } else if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        "image/jpeg"
+    } else if bytes.starts_with(b"GIF8") {
+        "image/gif"
+    } else if bytes.len() > 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP" {
+        "image/webp"
+    } else {
+        bail!("unsupported image format for {}: use png, jpeg, gif or webp", path.display());
+    };
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
 }
 
 /// CLI entry point for `codewhale exec` in engine mode. Stream-json events
@@ -377,6 +418,7 @@ pub(crate) async fn run_exec_agent(
     allowed_tools: Option<Vec<String>>,
     disallowed_tools: Option<Vec<String>>,
     append_system_prompt: Option<String>,
+    images: Vec<PathBuf>,
 ) -> Result<()> {
     let outcome = run_exec_agent_core(
         config,
@@ -393,6 +435,7 @@ pub(crate) async fn run_exec_agent(
         allowed_tools,
         disallowed_tools,
         append_system_prompt,
+        images,
         &ExecEventSink::Stdout,
         &CancellationToken::new(),
     )
@@ -436,6 +479,7 @@ async fn run_exec_agent_core(
     allowed_tools: Option<Vec<String>>,
     disallowed_tools: Option<Vec<String>>,
     append_system_prompt: Option<String>,
+    images: Vec<PathBuf>,
     sink: &ExecEventSink,
     cancel: &CancellationToken,
 ) -> Result<ExecOutcome> {
@@ -449,6 +493,12 @@ async fn run_exec_agent_core(
     use crate::tools::plan::new_shared_plan_state;
     use crate::tools::todo::new_shared_todo_list;
     use crate::tui::app::AppMode;
+
+    // Read attachments up front so a bad path fails before any model call.
+    let image_urls = images
+        .iter()
+        .map(|p| image_data_url(p))
+        .collect::<Result<Vec<_>>>()?;
 
     let route = resolve_cli_auto_route(config, model, prompt).await;
     let auto_model = route.auto_model;
@@ -620,6 +670,7 @@ async fn run_exec_agent_core(
                     .unwrap_or_default()
             },
             verbosity: config.verbosity.clone(),
+            images: image_urls,
         })
         .await?;
 
@@ -963,4 +1014,33 @@ async fn run_exec_agent_core(
         input_tokens: outcome_input_tokens,
         output_tokens: outcome_output_tokens,
     })
+}
+
+#[cfg(test)]
+mod image_attachment_tests {
+    use super::image_data_url;
+
+    #[test]
+    fn image_data_url_encodes_by_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("hero.PNG");
+        std::fs::write(&p, [0x89u8, b'P', b'N', b'G']).unwrap();
+        assert_eq!(image_data_url(&p).unwrap(), "data:image/png;base64,iVBORw==");
+        // 扩展名说 png, 内容其实是 jpeg → 按内容报 jpeg
+        let lying = dir.path().join("photo.png");
+        std::fs::write(&lying, [0xffu8, 0xd8, 0xff, 0xe0]).unwrap();
+        assert!(image_data_url(&lying).unwrap().starts_with("data:image/jpeg;base64,"));
+    }
+
+    #[test]
+    fn image_data_url_rejects_unknown_format_and_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bmp = dir.path().join("x.bmp");
+        std::fs::write(&bmp, [0u8]).unwrap();
+        assert!(image_data_url(&bmp).is_err());
+        assert!(image_data_url(&dir.path().join("missing.png")).is_err());
+        let big = dir.path().join("big.png");
+        std::fs::write(&big, vec![0u8; 3_750_001]).unwrap();
+        assert!(image_data_url(&big).is_err());
+    }
 }

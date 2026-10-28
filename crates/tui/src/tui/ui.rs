@@ -5624,6 +5624,7 @@ async fn dispatch_user_message(
             allowed_tools: app.active_allowed_tools.clone(),
             hook_executor: app.runtime_services.hook_executor.clone(),
             verbosity: app.verbosity.clone(),
+            images: Vec::new(),
         })
         .await
     {

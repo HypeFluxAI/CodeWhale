@@ -1115,6 +1115,7 @@ impl Engine {
                     allowed_tools,
                     hook_executor,
                     verbosity,
+                    images,
                 } => {
                     self.handle_send_message(
                         content,
@@ -1133,6 +1134,7 @@ impl Engine {
                         allowed_tools,
                         hook_executor,
                         verbosity,
+                        images,
                     )
                     .await;
                 }
@@ -1391,6 +1393,7 @@ impl Engine {
                         self.config.allowed_tools.clone(),
                         self.config.hook_executor.clone(),
                         self.config.verbosity.clone(),
+                        Vec::new(),
                     )
                     .await;
                 }
@@ -1546,6 +1549,7 @@ impl Engine {
         allowed_tools: Option<Vec<String>>,
         hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
         verbosity: Option<String>,
+        images: Vec<String>,
     ) {
         // Reset cancel token for fresh turn (in case previous was cancelled)
         self.reset_cancel_token();
@@ -1638,7 +1642,7 @@ impl Engine {
         }
 
         // Add user message to session
-        let user_msg = self.user_text_message_with_turn_metadata_for_route(
+        let mut user_msg = self.user_text_message_with_turn_metadata_for_route(
             content,
             mode,
             &model,
@@ -1646,6 +1650,7 @@ impl Engine {
             reasoning_effort.as_deref(),
             reasoning_effort_auto,
         );
+        attach_user_images(&mut user_msg, images);
         self.session.add_message(user_msg);
 
         let previous_goal_objective = self.config.goal_objective.clone();
@@ -2602,6 +2607,26 @@ fn system_prompt_hash(prompt: Option<&SystemPrompt>) -> u64 {
         }
     }
     hasher.finish()
+}
+
+/// Insert `image_url` parts for the user's attached images right after the
+/// user text, keeping the turn-metadata block last in the stored message
+/// (see `user_text_message_with_turn_metadata_for_route`). Block order is
+/// preserved on the Responses/Anthropic wires; the chat-completions wire
+/// joins the text blocks into one text part followed by the image parts.
+fn attach_user_images(msg: &mut Message, images: Vec<String>) {
+    if images.is_empty() {
+        return;
+    }
+    let at = msg.content.len().saturating_sub(1).max(1).min(msg.content.len());
+    for (i, url) in images.into_iter().enumerate() {
+        msg.content.insert(
+            at + i,
+            ContentBlock::ImageUrl {
+                image_url: crate::models::ImageUrlContent { url },
+            },
+        );
+    }
 }
 
 fn normalized_goal_objective(value: Option<&str>) -> Option<String> {

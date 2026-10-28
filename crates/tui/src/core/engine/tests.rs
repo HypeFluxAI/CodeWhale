@@ -4143,3 +4143,33 @@ async fn post_edit_hook_skips_unknown_tool_names() {
     assert!(engine.pending_lsp_blocks.is_empty());
     assert_eq!(fake.call_count(), 0);
 }
+
+#[test]
+fn attach_user_images_inserts_images_before_turn_metadata() {
+    let mut msg = Message {
+        role: "user".to_string(),
+        content: vec![
+            ContentBlock::Text { text: "make a game".into(), cache_control: None },
+            ContentBlock::Text { text: "<turn_meta>".into(), cache_control: None },
+        ],
+    };
+    attach_user_images(
+        &mut msg,
+        vec!["data:image/png;base64,AAA".into(), "data:image/jpeg;base64,BBB".into()],
+    );
+    assert_eq!(msg.content.len(), 4);
+    assert!(matches!(&msg.content[0], ContentBlock::Text { text, .. } if text == "make a game"));
+    assert!(matches!(&msg.content[1], ContentBlock::ImageUrl { image_url } if image_url.url.ends_with("AAA")));
+    assert!(matches!(&msg.content[2], ContentBlock::ImageUrl { image_url } if image_url.url.ends_with("BBB")));
+    assert!(matches!(&msg.content[3], ContentBlock::Text { text, .. } if text == "<turn_meta>"));
+}
+
+#[test]
+fn attach_user_images_is_noop_without_images() {
+    let mut msg = Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text { text: "hi".into(), cache_control: None }],
+    };
+    attach_user_images(&mut msg, Vec::new());
+    assert_eq!(msg.content.len(), 1);
+}

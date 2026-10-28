@@ -503,8 +503,9 @@ pub fn estimate_message_chars(messages: &[Message]) -> usize {
                 ContentBlock::ToolResult { content, .. } => total += content.len(),
                 ContentBlock::ServerToolUse { .. }
                 | ContentBlock::ToolSearchToolResult { .. }
-                | ContentBlock::CodeExecutionToolResult { .. }
-                | ContentBlock::ImageUrl { .. } => {}
+                | ContentBlock::CodeExecutionToolResult { .. } => {}
+                // ~1.6k tokens per image at ~4 chars/token
+                ContentBlock::ImageUrl { .. } => total += 6_400,
             }
         }
     }
