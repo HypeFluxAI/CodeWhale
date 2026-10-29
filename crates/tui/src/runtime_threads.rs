@@ -2080,6 +2080,7 @@ impl RuntimeThreadManager {
                 self.config.subagent_heartbeat_timeout_secs(),
             ),
             prefer_bwrap: self.config.prefer_bwrap.unwrap_or(false),
+            host_tools: crate::host_tools::HostTools::default(),
             memory_enabled: self.config.memory_enabled(),
             memory_path: self.config.memory_path(),
             speech_output_dir: self.config.speech_output_dir(),

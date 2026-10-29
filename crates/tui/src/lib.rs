@@ -41,6 +41,7 @@ mod dependencies;
 mod error_taxonomy;
 mod eval;
 pub mod exec;
+pub mod host_tools;
 #[cfg(feature = "execpolicy")]
 mod execpolicy;
 mod features;
@@ -210,7 +211,12 @@ struct Cli {
     fresh: bool,
 
     /// Skip loading project-level config from $WORKSPACE/.codewhale/config.toml
-    #[arg(long = "no-project-config")]
+    ///
+    /// `global` so it is also accepted after a subcommand: `exec`'s PROMPT is
+    /// `trailing_var_arg + allow_hyphen_values`, so an unknown flag there
+    /// silently became the start of the prompt and swallowed every flag after
+    /// it (--append-system-prompt / --resume / --image all turned into prompt text).
+    #[arg(long = "no-project-config", global = true)]
     no_project_config: bool,
 }
 
@@ -6068,6 +6074,27 @@ mod terminal_mode_tests {
         assert_eq!(args.resume.as_deref(), Some("abc123"));
         assert_eq!(args.output_format, ExecOutputFormat::StreamJson);
         assert_eq!(args.prompt, vec!["follow up"]);
+    }
+
+    #[test]
+    fn exec_no_project_config_after_subcommand_does_not_swallow_flags() {
+        // ThinkAI's invocation shape (both orders must parse the same).
+        for args in [
+            &["codewhale", "--no-project-config", "exec", "--auto", "--model", "m",
+              "--append-system-prompt", "SYS", "--resume", "abc123", "--image", "a.png", "do it"][..],
+            &["codewhale", "exec", "--auto", "--model", "m", "--no-project-config",
+              "--append-system-prompt", "SYS", "--resume", "abc123", "--image", "a.png", "do it"][..],
+        ] {
+            let cli = parse_cli(args);
+            assert!(cli.no_project_config, "{args:?}");
+            let Some(Commands::Exec(exec)) = cli.command else {
+                panic!("expected exec command");
+            };
+            assert_eq!(exec.prompt, vec!["do it"], "{args:?}");
+            assert_eq!(exec.resume.as_deref(), Some("abc123"));
+            assert_eq!(exec.images, vec![PathBuf::from("a.png")]);
+            assert_eq!(exec.append_system_prompt.as_deref(), Some("SYS"));
+        }
     }
 
     #[test]

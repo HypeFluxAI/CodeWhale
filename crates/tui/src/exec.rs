@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::config::{Config, MAX_SUBAGENTS};
 use crate::model_routing;
-use crate::models::{Message, SystemPrompt};
+use crate::models::{ContentBlock, Message, SystemPrompt};
 use crate::session_manager::{self, SessionManager, truncate_id};
 use crate::tui::history::{summarize_tool_args, summarize_tool_output};
 use crate::{ExecArgs, ExecOutputFormat};
@@ -169,6 +169,30 @@ pub(crate) fn exec_resume_command(session_id: &str) -> String {
     }
 }
 
+/// Attached images are sent in full only during the turn they arrive in: the
+/// saved session (what `--resume` replays on the next turn) carries a short
+/// text placeholder instead, so a long conversation doesn't re-send — and
+/// re-bill — every earlier image on every later request.
+fn without_images(messages: &[Message]) -> Vec<Message> {
+    messages
+        .iter()
+        .map(|m| Message {
+            role: m.role.clone(),
+            content: m
+                .content
+                .iter()
+                .map(|b| match b {
+                    ContentBlock::ImageUrl { .. } => ContentBlock::Text {
+                        text: "[image attached earlier — already viewed]".to_string(),
+                        cache_control: None,
+                    },
+                    other => other.clone(),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
 fn persist_exec_session(
     messages: &[Message],
     model: &str,
@@ -177,6 +201,8 @@ fn persist_exec_session(
     session_id: Option<&str>,
     total_tokens: u64,
 ) -> Result<String> {
+    let stripped = without_images(messages);
+    let messages = stripped.as_slice();
     let manager =
         SessionManager::default_location().context("could not open session manager for save")?;
     let saved = if let Some(id) = session_id.filter(|id| !id.trim().is_empty()) {
@@ -290,6 +316,8 @@ pub struct ExecRequest {
     pub state_dir: Option<PathBuf>,
     /// Images attached to the prompt (the CLI's repeatable `--image`).
     pub images: Vec<PathBuf>,
+    /// Extra tools implemented by the embedding app (see [`crate::host_tools`]).
+    pub host_tools: crate::host_tools::HostTools,
 }
 
 /// Run one exec-agent turn in-process.
@@ -356,6 +384,7 @@ pub async fn run_exec(
         disallowed_tools,
         req.append_system_prompt.clone(),
         req.images.clone(),
+        req.host_tools.clone(),
         &ExecEventSink::Channel(events),
         &cancel,
     )
@@ -436,6 +465,7 @@ pub(crate) async fn run_exec_agent(
         disallowed_tools,
         append_system_prompt,
         images,
+        crate::host_tools::HostTools::default(),
         &ExecEventSink::Stdout,
         &CancellationToken::new(),
     )
@@ -480,6 +510,7 @@ async fn run_exec_agent_core(
     disallowed_tools: Option<Vec<String>>,
     append_system_prompt: Option<String>,
     images: Vec<PathBuf>,
+    host_tools: crate::host_tools::HostTools,
     sink: &ExecEventSink,
     cancel: &CancellationToken,
 ) -> Result<ExecOutcome> {
@@ -592,6 +623,7 @@ async fn run_exec_agent_core(
         goal_objective: None,
         allowed_tools: allowed_tools.clone(),
         disallowed_tools: disallowed_tools.clone(),
+        host_tools,
         hook_executor: None,
         locale_tag: crate::localization::resolve_locale(&settings.locale)
             .tag()
@@ -1018,7 +1050,23 @@ async fn run_exec_agent_core(
 
 #[cfg(test)]
 mod image_attachment_tests {
-    use super::image_data_url;
+    use super::{image_data_url, without_images};
+    use crate::models::{ContentBlock, ImageUrlContent, Message};
+
+    #[test]
+    fn saved_sessions_drop_images_but_keep_text() {
+        let msgs = vec![Message {
+            role: "user".into(),
+            content: vec![
+                ContentBlock::Text { text: "make a game".into(), cache_control: None },
+                ContentBlock::ImageUrl { image_url: ImageUrlContent { url: "data:image/png;base64,AAAA".into() } },
+            ],
+        }];
+        let out = without_images(&msgs);
+        assert!(matches!(&out[0].content[0], ContentBlock::Text { text, .. } if text == "make a game"));
+        assert!(matches!(&out[0].content[1], ContentBlock::Text { text, .. } if text.contains("image attached earlier")));
+        assert!(!out[0].content.iter().any(|b| matches!(b, ContentBlock::ImageUrl { .. })));
+    }
 
     #[test]
     fn image_data_url_encodes_by_extension() {

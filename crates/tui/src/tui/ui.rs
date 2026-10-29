@@ -919,6 +919,7 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         stream_chunk_timeout: Duration::from_secs(app.stream_chunk_timeout_secs),
         subagent_heartbeat_timeout: Duration::from_secs(config.subagent_heartbeat_timeout_secs()),
         prefer_bwrap: config.prefer_bwrap.unwrap_or(false),
+        host_tools: crate::host_tools::HostTools::default(),
         memory_enabled: config.memory_enabled(),
         memory_path: config.memory_path(),
         speech_output_dir: config.speech_output_dir(),

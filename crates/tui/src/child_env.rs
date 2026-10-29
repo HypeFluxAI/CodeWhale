@@ -144,6 +144,10 @@ fn is_allowed_parent_env_key(key: &OsStr) -> bool {
             | "TEMP"
             | "__CF_USER_TEXT_ENCODING"
             | "SYSTEMROOT"
+            // Without SystemDrive, DLLs injected into every GUI-capable
+            // process (e.g. the Sogou IME) expand `%SystemDrive%\ProgramData`
+            // literally and litter the cwd with a `%SystemDrive%` folder.
+            | "SYSTEMDRIVE"
             | "WINDIR"
             | "COMSPEC"
             | "PATHEXT"
@@ -388,6 +392,7 @@ mod tests {
             "PROGRAMFILES(X86)",
             "PROGRAMW6432",
             "PROCESSOR_ARCHITECTURE",
+            "SystemDrive",
             "NUGET_PACKAGES",
             "DOTNET_ROOT",
             "DOTNET_CLI_TELEMETRY_OPTOUT",

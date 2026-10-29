@@ -498,6 +498,12 @@ impl ToolRegistryBuilder {
         self
     }
 
+    /// Whether a tool with this name has already been added.
+    #[must_use]
+    pub fn has_tool(&self, name: &str) -> bool {
+        self.tools.iter().any(|t| t.name() == name)
+    }
+
     /// Include file tools (read, write, edit, list).
     #[must_use]
     pub fn with_file_tools(self) -> Self {

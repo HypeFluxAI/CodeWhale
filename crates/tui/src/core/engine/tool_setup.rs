@@ -114,6 +114,23 @@ impl Engine {
         // so there's no failure mode worth gating on.
         builder = builder.with_notify_tool();
 
+        // Embedder-provided tools (in-process `run_exec`). They can write files /
+        // hit the network, so keep plan mode read-only. A host tool may never
+        // replace a built-in (that would silently swap its approval/sandbox
+        // semantics), so name collisions are skipped loudly.
+        if mode != AppMode::Plan {
+            for tool in &self.config.host_tools.0 {
+                if builder.has_tool(tool.name()) {
+                    tracing::error!(
+                        tool = tool.name(),
+                        "host tool name collides with a built-in tool; host tool skipped"
+                    );
+                    continue;
+                }
+                builder = builder.with_tool(tool.clone());
+            }
+        }
+
         builder
     }
 }

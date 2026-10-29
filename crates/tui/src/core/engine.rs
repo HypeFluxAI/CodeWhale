@@ -380,6 +380,9 @@ pub struct EngineConfig {
     /// Applied to the per-turn tool registry after built-in tools are registered.
     /// When `None`, no overrides or plugin loading occurs.
     pub tools: Option<crate::config::ToolsConfig>,
+    /// Tools supplied by an embedding app (in-process `run_exec`); registered
+    /// into every turn's registry outside plan mode.
+    pub host_tools: crate::host_tools::HostTools,
 }
 
 impl Default for EngineConfig {
@@ -438,6 +441,7 @@ impl Default for EngineConfig {
             ),
             tools_always_load: HashSet::new(),
             prefer_bwrap: false,
+            host_tools: crate::host_tools::HostTools::default(),
             verbosity: None,
             tools: None,
         }
@@ -1815,6 +1819,21 @@ impl Engine {
             std::collections::HashSet::new();
         if let Some(ref mut tool_registry) = tool_registry {
             plugin_tool_names = configure_plugin_tools(tool_registry, self.config.tools.as_ref());
+        }
+        // Embedder (host) tools are the reason the embedder runs us; like plugin
+        // tools they must be in the model-visible catalog from the first turn,
+        // not deferred behind tool search.
+        // (only ones actually registered — a host tool skipped for a name collision
+        // must not make the same-named built-in non-deferred.)
+        if let Some(ref registry) = tool_registry {
+            plugin_tool_names.extend(
+                self.config
+                    .host_tools
+                    .0
+                    .iter()
+                    .filter(|t| registry.get(t.name()).is_some_and(|r| std::sync::Arc::as_ptr(&r).cast::<()>() == std::sync::Arc::as_ptr(t).cast::<()>()))
+                    .map(|t| t.name().to_string()),
+            );
         }
 
         let mcp_tools = if self.config.features.enabled(Feature::Mcp) {
